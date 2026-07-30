@@ -31,3 +31,4 @@ the authenticated browser context in memory. `/logout` closes it.
 If Razer requires a visible CAPTCHA or verification step, set
 `RAZER_HEADLESS=false`, restart the bot, and try `/login` again.
 
+.\.venv\Scripts\python.exe .\bot.py

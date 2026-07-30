@@ -31,10 +31,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+# HTTPX logs full Telegram request URLs, which contain the bot token. Never
+# allow those request lines into console or redirected log files.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-EMAIL, PASSWORD = range(2)
+EMAIL, PASSWORD, BACKUP_CODES, PRODUCT_CODE = range(4)
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+PRODUCTS_BY_CODE = {
+    "830": "Yalla Ludo - USD 2 Diamonds",
+    "2320": "Yalla Ludo - USD 5 Diamonds",
+    "5k": "Yalla Ludo - USD 10 Diamonds",
+    "13k": "Yalla Ludo - USD 25 Diamonds",
+    "27k": "Yalla Ludo - USD 50 Diamonds",
+    "56k": "Yalla Ludo - USD 100 Diamonds",
+}
 
 
 def _sessions(context: ContextTypes.DEFAULT_TYPE) -> RazerSessionManager:
@@ -104,24 +116,71 @@ async def receive_password(
         return ConversationHandler.END
     message = update.effective_message
     password = message.text or ""
-    email = context.user_data.pop("razer_email", "")
-    context.user_data.clear()
 
     with contextlib.suppress(BadRequest, Forbidden):
         await message.delete()
 
-    if not email or not password:
+    if not context.user_data.get("razer_email") or not password:
+        context.user_data.clear()
         await update.effective_chat.send_message(
             "Email or password was missing. Use /login to try again."
         )
         return ConversationHandler.END
 
+    context.user_data["razer_password"] = password
+    password = ""
+    await update.effective_chat.send_message(
+        "Send all 10 Razer backup codes in one message, one code per line.\n"
+        "Only the first code will be used. The message will be deleted."
+    )
+    return BACKUP_CODES
+
+
+def _parse_backup_codes(value: str) -> list[str]:
+    codes: list[str] = []
+    for line in value.splitlines():
+        compact = re.sub(r"[^A-Za-z0-9]", "", line)
+        if len(compact) == 8:
+            codes.append(compact.upper())
+    if not codes:
+        codes = [
+            match.upper()
+            for match in re.findall(
+                r"(?<![A-Za-z0-9])[A-Za-z0-9]{8}(?![A-Za-z0-9])",
+                value,
+            )
+        ]
+    return codes
+
+
+async def receive_backup_codes(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if await _reject_if_needed(update):
+        return ConversationHandler.END
+    message = update.effective_message
+    codes = _parse_backup_codes(message.text or "")
+    with contextlib.suppress(BadRequest, Forbidden):
+        await message.delete()
+    if len(codes) < 10:
+        await update.effective_chat.send_message(
+            "I could not read 10 backup codes. Send all 10 again, one per line."
+        )
+        return BACKUP_CODES
+
+    email = context.user_data.pop("razer_email", "")
+    password = context.user_data.pop("razer_password", "")
+    context.user_data.clear()
+    first_backup_code = codes[0]
+    codes.clear()
     status = await update.effective_chat.send_message("Logging in to Razer ID...")
+    next_state = ConversationHandler.END
     try:
         await _sessions(context).login(
             update.effective_user.id,
             email,
             password,
+            first_backup_code,
         )
     except InvalidCredentialsError:
         await status.edit_text("Login failed: incorrect email or password.")
@@ -134,11 +193,42 @@ async def receive_password(
         await status.edit_text("Login failed because of an unexpected browser error.")
     else:
         await status.edit_text(
-            "Razer login successful. The authenticated session is ready."
+            "Razer login successful. The Yalla Ludo product menu is ready.\n\n"
+            "Send a product code:\n"
+            "830, 2320, 5k, 13k, 27k, or 56k"
         )
+        next_state = PRODUCT_CODE
     finally:
         password = ""
-    return ConversationHandler.END
+        first_backup_code = ""
+    return next_state
+
+
+async def receive_product_code(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if await _reject_if_needed(update):
+        return ConversationHandler.END
+    normalized = re.sub(
+        r"\s+",
+        "",
+        (update.effective_message.text or "").casefold(),
+    )
+    product_name = PRODUCTS_BY_CODE.get(normalized)
+    if product_name is None:
+        await update.effective_message.reply_text("Unknown product code.")
+        return PRODUCT_CODE
+
+    try:
+        await _sessions(context).select_product(
+            update.effective_user.id,
+            product_name,
+        )
+    except RazerLoginError as exc:
+        await update.effective_message.reply_text(f"Selection failed: {exc}")
+        return PRODUCT_CODE
+    await update.effective_message.reply_text(f"Selected: {product_name}.")
+    return PRODUCT_CODE
 
 
 async def logout_command(
@@ -196,6 +286,14 @@ def build_application() -> Application:
                 CommandHandler("cancel", cancel_command),
                 MessageHandler(filters.TEXT, receive_password),
             ],
+            BACKUP_CODES: [
+                CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.TEXT, receive_backup_codes),
+            ],
+            PRODUCT_CODE: [
+                CommandHandler("cancel", cancel_command),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_product_code),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
     )
@@ -206,9 +304,13 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    build_application().run_polling(drop_pending_updates=True)
+    # Telegram can be temporarily unreachable on some host networks. Keep the
+    # process alive and retry bootstrap instead of exiting on the first timeout.
+    build_application().run_polling(
+        drop_pending_updates=True,
+        bootstrap_retries=-1,
+    )
 
 
 if __name__ == "__main__":
     main()
-
