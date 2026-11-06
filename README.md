@@ -47,7 +47,8 @@ sudo docker compose logs -f bot
 ```
 
 In `nano .env` set `TELEGRAM_BOT_TOKEN`, `BOT_OWNER_ID`, `BOT_SECRET_KEY` and
-`TZ`. The browser always runs headless in Docker. When the logs show
+`TZ`. In Docker, Chromium runs normally inside a virtual screen (Xvfb), not
+headless. Headless logins stalled on Razer. When the logs show
 `Application started`, send `/newaccount` and `/order` in Telegram.
 
 Update after code changes:

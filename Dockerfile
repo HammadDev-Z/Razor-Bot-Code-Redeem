@@ -3,8 +3,9 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 WORKDIR /app
 
-# tzdata lets TZ (set in docker-compose.yml) show local times in /status.
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+# tzdata: TZ (docker-compose.yml) shows local times in /status.
+# xvfb: a virtual screen, so Chromium runs normally rather than headless.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -16,4 +17,5 @@ COPY --chown=bot:bot . .
 RUN mkdir -p /app/data /app/debug && chown -R bot:bot /app/data /app/debug
 USER bot
 
+ENTRYPOINT ["sh", "/app/docker-entrypoint.sh"]
 CMD ["python", "bot.py"]

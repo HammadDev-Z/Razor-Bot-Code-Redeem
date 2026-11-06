@@ -3,9 +3,9 @@ services:
     build: .
     env_file: .env
     environment:
-      # A server has no screen, so the browser must run headless here even if
-      # .env says otherwise (it is false on the Windows PC for watching).
-      RAZER_HEADLESS: "true"
+      # Normal Chromium in a virtual screen (see docker-entrypoint.sh), the same
+      # mode the bot was verified in on the PC. Headless login stalled on Razer.
+      RAZER_HEADLESS: "false"
       TZ: ${TZ:-UTC}
     restart: unless-stopped
     init: true

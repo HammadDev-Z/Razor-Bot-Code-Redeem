@@ -21,7 +21,8 @@ Copy-Item .env.example .env   # set TELEGRAM_BOT_TOKEN, BOT_OWNER_ID, BOT_SECRET
 
 Production runs on the VPS with Docker, the same way as the sibling YLBots projects:
 - The code is in `/root/Razor-Bot-Code-Redeem`. Deploy with `git pull && sudo docker compose up -d --build`, and check with `sudo docker compose logs -f bot`.
-- `docker-compose.yml` forces `RAZER_HEADLESS=true`.
+- `docker-compose.yml` sets `RAZER_HEADLESS=false`, and `docker-entrypoint.sh` starts Xvfb (`DISPLAY=:99`), so Chromium runs headed just as it did on the PC. The first headless run on the VPS stalled at login.
+- A failed login always saves screenshots of every tab (`_snapshot_context`, `debug/*-login-*`).
 - State is kept in the `bot-data` volume (`/app/data`) and snapshots in `bot-debug` (`/app/debug`). Never suggest `down -v`.
 - Only one instance may poll the bot token at a time, so the PC and the VPS can't both run it.
 

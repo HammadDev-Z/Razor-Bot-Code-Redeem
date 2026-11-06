@@ -1287,9 +1287,10 @@ class RazerSessionManager:
                 )
             )
             if challenge_seen and self.headless:
+                await self._snapshot_context(context, "login-verification")
                 raise VerificationRequiredError(
-                    "Razer requires CAPTCHA or verification. Set "
-                    "RAZER_HEADLESS=false and try /login again."
+                    "Razer asked for a CAPTCHA or verification at login. "
+                    "Screenshots were saved in debug/."
                 )
 
             for candidate in reversed(context.pages):
@@ -1299,9 +1300,19 @@ class RazerSessionManager:
                     return candidate
             await asyncio.sleep(0.2)
 
+        # Always keep evidence of a failed login, whatever the snapshot setting.
+        await self._snapshot_context(context, "login-timeout")
         if challenge_seen:
-            raise VerificationRequiredError("Razer verification timed out.")
-        raise RazerLoginError("Razer login timed out.")
+            raise VerificationRequiredError(
+                "Razer verification timed out. Screenshots were saved in debug/."
+            )
+        raise RazerLoginError("Razer login timed out. Screenshots were saved in debug/.")
+
+    async def _snapshot_context(self, context: BrowserContext, label: str) -> None:
+        """Force-save every open tab (login can spread over several)."""
+        for index, candidate in enumerate(list(context.pages)):
+            if not candidate.is_closed():
+                await self._snapshot(candidate, f"{label}-tab{index}", force=True)
 
     async def _open_yalla_ludo(
         self, context: BrowserContext, dashboard: Page
