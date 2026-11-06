@@ -21,6 +21,7 @@ from playwright.async_api import (
     Locator,
     Page,
     Playwright,
+    Route,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -88,6 +89,10 @@ def _code_tokens(text: str) -> list[str]:
         if sum(ch.isdigit() for ch in token) >= 2 and token not in tokens:
             tokens.append(token)
     return tokens
+_HEAVY_MEDIA_URL = re.compile(
+    r"\.(?:png|jpe?g|gif|webp|avif|mp4|webm|m3u8)(?:[?#]|$)", re.IGNORECASE
+)
+_CHECKOUT_TEXT = re.compile(r"^\s*CHECKOUT\s*>?\s*$", re.IGNORECASE)
 # With too little Gold, Razer swaps CHECKOUT for this button (confirmed live).
 _RELOAD_TO_CHECKOUT = (
     "[data-cs-override-id='purchase-webshop-reload-checkout-btn'], "
@@ -185,6 +190,8 @@ class RazerSessionManager:
         ).strip()
         self.login_timeout_ms = int(os.getenv("RAZER_LOGIN_TIMEOUT_MS", "120000"))
         self.snapshots_enabled = _env_bool("RAZER_DEBUG_SNAPSHOTS", False)
+        # Optional: skip pictures and video on gold.razer.com to cut load.
+        self.block_images = _env_bool("RAZER_BLOCK_IMAGES", False)
         self.snapshot_dir = Path(__file__).with_name("debug")
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -212,6 +219,20 @@ class RazerSessionManager:
                 await self._playwright.stop()
             self._playwright = None
 
+    @staticmethod
+    async def _skip_heavy_media(route: Route) -> None:
+        """Drop pictures and video on gold.razer.com only; sign-in and the 2-step
+        box (razerid.razer.com) always load fully."""
+        try:
+            on_gold = "gold.razer.com" in route.request.frame.url
+        except PlaywrightError:
+            on_gold = False
+        with contextlib.suppress(PlaywrightError):
+            if on_gold:
+                await route.abort()
+            else:
+                await route.continue_()
+
     async def open_account(
         self,
         email: str,
@@ -227,6 +248,10 @@ class RazerSessionManager:
             storage_state=storage_state,
         )
         context.set_default_timeout(30_000)
+        if self.block_images:
+            await context.route(
+                lambda url: bool(_HEAVY_MEDIA_URL.search(url)), self._skip_heavy_media
+            )
         try:
             page = await context.new_page()
             page = await self._open_authenticated(
@@ -573,7 +598,39 @@ class RazerSessionManager:
         Contract with the caller: RazerLoginError is raised only when nothing
         was bought (before CHECKOUT, or while 2-step is still blocking the
         payment). Anything ambiguous returns UNCERTAIN instead.
+
+        The log line "Purchase of X took N s (...)" shows where the time went.
         """
+        started = time.monotonic()
+        last = started
+        laps: list[str] = []
+
+        def lap(label: str) -> None:
+            nonlocal last
+            now = time.monotonic()
+            laps.append(f"{label} {now - last:.1f}s")
+            last = now
+
+        try:
+            return await self._purchase_steps(
+                session, product_name, mark_pending, take_code, lap
+            )
+        finally:
+            logger.info(
+                "Purchase of %s took %.1fs (%s)",
+                product_name,
+                time.monotonic() - started,
+                ", ".join(laps),
+            )
+
+    async def _purchase_steps(
+        self,
+        session: RazerAccountSession,
+        product_name: str,
+        mark_pending: Callable[[], Awaitable[None]],
+        take_code: Callable[[], Awaitable[str]],
+        lap: Callable[[str], None],
+    ) -> PurchaseOutcome:
         if product_name not in PRODUCTS_BY_CODE.values():
             raise RazerLoginError("Unknown or unsafe product selection.")
 
@@ -583,7 +640,9 @@ class RazerSessionManager:
         session.last_pin = None
         page = session.page
         await self._dismiss_cookie_banner(page)
+        lap("menu")
         await self._select_product(page, product_name)
+        lap("select")
 
         razer_gold = await self._find_razer_gold_payment(page, timeout_ms=15_000)
         if razer_gold is None:
@@ -591,6 +650,7 @@ class RazerSessionManager:
             raise RazerLoginError("Razer Gold payment method was not found.")
         await self._click_text_control(razer_gold)
         await self._snapshot(page, "payment-selected")
+        lap("payment")
         if _INSUFFICIENT_PATTERN.search(await self._page_text(page)):
             return PurchaseOutcome.INSUFFICIENT_GOLD
 
@@ -610,18 +670,21 @@ class RazerSessionManager:
             raise RazerLoginError("CHECKOUT button was not found.")
         # Last check before paying: Razer can still switch the product back.
         await self._verify_selected(page, product_name)
+        lap("checkout-ready")
 
         await mark_pending()
         # If this click raises, nothing was submitted (RazerLoginError).
         await self._click_text_control(checkout)
         stage = await self._wait_for_checkout_stage(session, timeout_ms=60_000)
         page = session.page
+        lap(f"razer-{stage}")
         if stage == "success":
             await self._snapshot(page, "success-no-2fa")
             session.last_purchased = await self._receipt_product(page)
             session.last_pin = await self._receipt_pin(page)
             if session.last_pin is None:
                 await self._snapshot(page, "success-no-pin", force=True)
+            lap("receipt")
             return PurchaseOutcome.SUCCESS
         if stage == "insufficient":
             await self._snapshot(page, "insufficient")
@@ -645,12 +708,16 @@ class RazerSessionManager:
             await self._snapshot(page, "backup-entry")
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
             raise RazerLoginError("The 2-step screen stopped responding.") from exc
+        lap("two-step-menu")
 
         code = await take_code()
         try:
             await self._type_backup_code(inputs, code)
             await self._snapshot(page, "code-entered")
-            return await self._wait_for_purchase_outcome(session)
+            lap("code-typed")
+            outcome = await self._wait_for_purchase_outcome(session)
+            lap(f"razer-{outcome.name.lower()}")
+            return outcome
         except Exception:
             logger.exception("Purchase result unknown after the backup code was used")
             await self._snapshot(page, "outcome-error")
@@ -821,7 +888,7 @@ class RazerSessionManager:
                 if _INSUFFICIENT_PATTERN.search(text):
                     session.page = candidate
                     return "insufficient"
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.1)
         return "unknown"
 
     async def _wait_for_purchase_outcome(
@@ -864,7 +931,7 @@ class RazerSessionManager:
                     clicked = await self._click_first(session.page, buttons)
                 if clicked:
                     await self._snapshot(session.page, "confirm-clicked")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)
         await self._snapshot(session.page, "outcome-unknown")
         return PurchaseOutcome.UNCERTAIN
 
@@ -1235,7 +1302,15 @@ class RazerSessionManager:
                 )
             with contextlib.suppress(PlaywrightError):
                 await page.mouse.wheel(0, 3_000)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
+            # Stop as soon as the button we are scrolling for is on screen.
+            with contextlib.suppress(PlaywrightError):
+                if await page.locator(_RELOAD_TO_CHECKOUT).first.is_visible():
+                    return
+                checkout = page.get_by_text(_CHECKOUT_TEXT)
+                for index in range(await checkout.count()):
+                    if await checkout.nth(index).is_visible():
+                        return
 
     @staticmethod
     async def _find_backup_code_inputs(scope: OtpScope) -> list[Locator]:
@@ -1270,7 +1345,7 @@ class RazerSessionManager:
         """Type like a person so per-box OTP widgets advance focus themselves."""
         page = inputs[0].page
         await inputs[0].click()
-        await page.keyboard.type(code, delay=90)
+        await page.keyboard.type(code, delay=40)
 
         async def entered() -> str | None:
             """What the boxes hold, or None if they are gone (code submitted)."""

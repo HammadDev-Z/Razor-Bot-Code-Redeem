@@ -109,6 +109,10 @@ one finished. `/status` shows the last and next check. Set
 If Razer requires a visible CAPTCHA or verification step, set
 `RAZER_HEADLESS=false` and restart.
 
+Each purchase writes a log line with its timing per step (`sudo docker compose logs bot | grep "Purchase of"`).
+Most of it is Razer processing the checkout. Optional: `RAZER_BLOCK_IMAGES=true` skips pictures and
+video on gold.razer.com to lighten the browser; leave it off if anything misbehaves.
+
 ## Debug snapshots
 
 With `RAZER_DEBUG_SNAPSHOTS=true`, every purchase step saves a screenshot and
