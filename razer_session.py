@@ -63,9 +63,12 @@ _SECURITY_SECTION_PATTERN = re.compile(
     r"^\s*(security|account\s+security|security\s+settings|two[- ]step|2[- ]step)\b",
     re.IGNORECASE,
 )
-_GENERATE_CODES_PATTERN = re.compile(
-    r"(re)?generate|get\s+new\s+codes|new\s+(backup\s+)?codes", re.IGNORECASE
-)
+# The page button (confirmed live: "GENERATE NEW CODES") and the dialog button
+# (confirmed live: "GET NEW CODES"). Razer shows that dialog both on arrival
+# ("You have 9 backup codes remaining ...") and, possibly, after Generate, so
+# the two are handled separately. "Generated on: ..." must never match.
+_GENERATE_CODES_PATTERN = re.compile(r"^\s*(re)?generate\b", re.IGNORECASE)
+_GET_NEW_CODES_PATTERN = re.compile(r"^\s*get\s+new\s+codes\s*$", re.IGNORECASE)
 _CONFIRM_BUTTON_PATTERN = re.compile(
     r"^\s*(yes|confirm|continue|ok|proceed|generate|regenerate|get\s+new\s+codes)\b",
     re.IGNORECASE,
@@ -316,8 +319,11 @@ class RazerSessionManager:
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 120
-            verified = generate_clicked = confirm_clicked = False
+            verified = generate_clicked = False
             verified_at = 0.0
+            button_seen_at: float | None = None
+            last_click_at = -1_000.0
+            get_clicks = generate_clicks = 0
             revisited = False
             while loop.time() < deadline:
                 scope = await self._find_otp_scope(page)
@@ -353,13 +359,10 @@ class RazerSessionManager:
                     await self._dismiss_cookie_banner(page)
                     continue
 
-                # Codes count as new only after generate was clicked: before
-                # that the page may list old (used or unused) codes.
-                new_codes = [
-                    code
-                    for code in _code_tokens(await self._full_text(page))
-                    if code not in exclude
-                ]
+                # Codes count as new only after a generating click: before
+                # that the page lists the old (used or unused) codes.
+                tokens_now = _code_tokens(await self._full_text(page))
+                new_codes = [code for code in tokens_now if code not in exclude]
                 if generate_clicked and len(new_codes) >= 5:
                     await page.wait_for_timeout(1_000)  # let the full list render
                     new_codes = [
@@ -370,20 +373,48 @@ class RazerSessionManager:
                     await self._snapshot(page, "codes-6-new-codes", force=True)
                     return new_codes
 
-                if not generate_clicked:
+                # "GET NEW CODES" (a dialog) is handled before the page's
+                # "GENERATE NEW CODES": while it is open it covers the page.
+                get_new = await self._find_pattern(
+                    page, _GET_NEW_CODES_PATTERN, timeout_ms=300
+                )
+                generate = None
+                if get_new is None:
                     generate = await self._find_pattern(
-                        page, _GENERATE_CODES_PATTERN, timeout_ms=500
+                        page, _GENERATE_CODES_PATTERN, timeout_ms=300
                     )
-                    if generate is not None:
-                        await self._snapshot(page, "codes-5-generate", force=True)
-                        exclude |= set(_code_tokens(await self._full_text(page)))
+                button = get_new or generate
+                if button is not None and button_seen_at is None:
+                    button_seen_at = loop.time()
+                since_click = loop.time() - last_click_at
+                # Never click before the current list has loaded, or the old
+                # codes could later be taken for new ones.
+                list_ready = bool(tokens_now) or (
+                    button_seen_at is not None and loop.time() - button_seen_at > 8
+                )
+                clicked_now = False
+                if button is not None and list_ready:
+                    if get_new is not None and get_clicks < 3 and since_click > 1.5:
+                        get_clicks += 1
+                        label = "codes-5-get-new"
+                    elif generate is not None and generate_clicks < 2 and since_click > 8:
+                        generate_clicks += 1
+                        label = "codes-5-generate"
+                    else:
+                        label = ""
+                    if label:
+                        await self._snapshot(page, label, force=True)
+                        exclude |= set(tokens_now)
                         generate_clicked = True
-                        await self._click_text_control(generate)
-                elif not confirm_clicked:
+                        last_click_at = loop.time()
+                        clicked_now = True
+                        await self._click_text_control(button)
+                if not clicked_now and generate_clicked and since_click > 1.5:
+                    # Some other confirmation inside a dialog (Yes / Confirm ...).
                     confirm = await self._find_confirm_button(page)
                     if confirm is not None:
                         await self._snapshot(page, "codes-5-confirm", force=True)
-                        confirm_clicked = True
+                        last_click_at = loop.time()
                         await self._click_text_control(confirm)
                 await asyncio.sleep(0.5)
 
@@ -444,6 +475,7 @@ class RazerSessionManager:
                     ],
                 )
             await asyncio.sleep(0.5)
+        await self._snapshot(page, "codes-3-not-finished", force=True)
         raise RazerLoginError("2-step verification did not finish.")
 
     async def _find_confirm_button(self, page: Page) -> Locator | None:
