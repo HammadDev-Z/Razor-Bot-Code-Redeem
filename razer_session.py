@@ -276,6 +276,7 @@ class RazerSessionManager:
         try:
             page = await self._open_razer_id(context, page, email, password)
             await self._snapshot(page, "codes-1-profile", force=True)
+            await self._dismiss_cookie_banner(page)
             item = await self._find_backup_codes_item(page)
             if item is None:
                 await self._snapshot(page, "codes-2-not-found", force=True)
@@ -420,6 +421,7 @@ class RazerSessionManager:
         """Open razerid.razer.com logged in. Its session is separate from Gold's."""
         with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
             await page.goto(RAZER_ID_URL, wait_until="domcontentloaded", timeout=60_000)
+        await self._dismiss_cookie_banner(page)
         deadline = asyncio.get_running_loop().time() + 8
         while asyncio.get_running_loop().time() < deadline:
             if await self._is_authenticated(page):
@@ -479,6 +481,7 @@ class RazerSessionManager:
         session.on_product_menu = False
         session.last_purchased = None
         page = session.page
+        await self._dismiss_cookie_banner(page)
         await self._select_product(page, product_name)
 
         razer_gold = await self._find_razer_gold_payment(page, timeout_ms=15_000)
@@ -565,6 +568,7 @@ class RazerSessionManager:
                 await page.goto(
                     self.account_url, wait_until="domcontentloaded", timeout=60_000
                 )
+            await self._dismiss_cookie_banner(page)
             deadline = asyncio.get_running_loop().time() + 8
             while asyncio.get_running_loop().time() < deadline:
                 if await self._is_authenticated(page):
@@ -590,6 +594,7 @@ class RazerSessionManager:
             )
         except (PlaywrightTimeoutError, PlaywrightError) as exc:
             raise RazerLoginError("Yalla Ludo page could not be reopened.") from exc
+        await self._dismiss_cookie_banner(session.page)
         await self._wait_for_product_menu(session.page)
         session.on_product_menu = True
 
@@ -1214,6 +1219,7 @@ class RazerSessionManager:
             )
         except PlaywrightTimeoutError as exc:
             raise RazerLoginError("Razer did not open.") from exc
+        await self._dismiss_cookie_banner(page)
 
         email_input = await self._find_visible(
             context, self._email_selectors(), timeout_ms=2_000
@@ -1268,6 +1274,8 @@ class RazerSessionManager:
         deadline = asyncio.get_running_loop().time() + self.login_timeout_ms / 1000
         challenge_seen = False
         while asyncio.get_running_loop().time() < deadline:
+            # The cookie banner covers the consent form, so clear it first.
+            await self._dismiss_cookie_banners(context)
             for candidate in list(context.pages):
                 if await self._looks_like_consent(candidate):
                     await self._decline_consent(candidate)
@@ -1318,6 +1326,7 @@ class RazerSessionManager:
         self, context: BrowserContext, dashboard: Page
     ) -> Page:
         """Open Razer Gold, search for Yalla, and stop on Yalla Ludo."""
+        await self._dismiss_cookie_banners(context)
         page = dashboard
         if "razerid.razer.com" in dashboard.url:
             recharge = await self._wait_for_visible_locator(
@@ -1637,6 +1646,33 @@ class RazerSessionManager:
             )
         except (PlaywrightTimeoutError, PlaywrightError):
             return False
+
+    @staticmethod
+    async def _dismiss_cookie_banner(page: Page) -> bool:
+        """Press "Reject All" on Razer's cookie banner if it is showing.
+
+        Shown to EU visitors (e.g. the VPS) and not on the PC; it covers the
+        page, so clicks meant for the form underneath land on it. Rejecting is
+        the most privacy-preserving choice, and the consent cookie it sets is
+        kept in the saved storage_state, so it should not return.
+        """
+        buttons = page.locator(
+            "[data-cky-tag='reject-button'], "
+            "button.cky-btn-reject, button[aria-label='Reject All' i]"
+        )
+        with contextlib.suppress(PlaywrightError):
+            for index in range(await buttons.count()):
+                button = buttons.nth(index)
+                if await button.is_visible():
+                    await button.click(timeout=5_000)
+                    await page.wait_for_timeout(500)
+                    return True
+        return False
+
+    async def _dismiss_cookie_banners(self, context: BrowserContext) -> None:
+        for candidate in list(context.pages):
+            if not candidate.is_closed():
+                await self._dismiss_cookie_banner(candidate)
 
     @staticmethod
     async def _looks_like_consent(page: Page) -> bool:
