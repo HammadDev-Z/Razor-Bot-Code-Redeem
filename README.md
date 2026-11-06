@@ -91,6 +91,8 @@ If the bot types a backup code but cannot confirm the purchase result, it pauses
 and asks you to check your Razer transaction history and `/resolve`, so it never
 buys twice by mistake.
 
+The bot checks every 30 minutes, but only messages you when something changed (bought, order done, a new problem), so a long wait for a top-up stays quiet. Each message ends with the Razer Gold left. `/status` shows the last and next check; set `NOTIFY_EVERY_CHECK=true` for a message after every check.
+
 If Razer requires a visible CAPTCHA or verification step, set
 `RAZER_HEADLESS=false` and restart.
 

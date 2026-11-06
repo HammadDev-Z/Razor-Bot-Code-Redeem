@@ -70,6 +70,7 @@ class Purchaser:
         notify: Notify,
         interval_minutes: int,
         refresh_at: int = 2,
+        notify_every_check: bool = False,
     ) -> None:
         self._store = store
         self._sessions = sessions
@@ -77,6 +78,8 @@ class Purchaser:
         self._interval_minutes = interval_minutes
         # Get new backup codes from Razer ID once this few (or fewer) are left.
         self._refresh_at = refresh_at
+        # Message after every check, even when nothing changed since the last one.
+        self._notify_every_check = notify_every_check
         self._lock = asyncio.Lock()
 
     @property
@@ -88,7 +91,9 @@ class Purchaser:
             return
         async with self._lock:
             try:
+                logger.info("Purchase check started (%s)", "manual" if manual else "timer")
                 await self._run_cycle(manual)
+                logger.info("Purchase check finished")
             except Exception:
                 logger.exception("Purchase check failed")
                 await self._report(
@@ -192,6 +197,7 @@ class Purchaser:
 
         bought = 0
         stop_message = ""
+        balance_now: float | None = None
         try:
             if (state := self._current(account_id)) is None:
                 return
@@ -298,6 +304,14 @@ class Purchaser:
                 self._store.save()
             stop_message = f"Stopped: {exc} Retrying at the next check."
         finally:
+            # What the purchases left, read before the browser is closed.
+            try:
+                balance_now = await self._sessions.current_balance(session)
+            except Exception:
+                balance_now = None
+            if (live := self._current(account_id)) is not None and balance_now is not None:
+                live.last_balance = balance_now
+                self._store.save()
             storage_state = await self._sessions.close(session)
             if (live := self._current(account_id)) is not None and storage_state:
                 live.storage_state = storage_state
@@ -305,16 +319,30 @@ class Purchaser:
 
         if self._current(account_id) is None:
             return
-        await self._report(stop_message, force=manual or bought > 0, bought=bought)
+        await self._report(
+            stop_message,
+            force=manual or bought > 0,
+            bought=bought,
+            balance=balance_now,
+        )
 
-    async def _report(self, message: str, *, force: bool, bought: int = 0) -> None:
+    async def _report(
+        self,
+        message: str,
+        *,
+        force: bool,
+        bought: int = 0,
+        balance: float | None = None,
+    ) -> None:
         """Send a status message, skipping exact repeats of the last one.
 
         The timer runs every 30 minutes; without this, "not enough Gold" would
-        be sent every half hour until the account is topped up.
+        be sent every half hour until the account is topped up. Set
+        NOTIFY_EVERY_CHECK=true to get a message after every check anyway.
+        ``balance`` is the Gold left, read at the end of this check.
         """
         state = self._store.state
-        if not force and message == state.last_notice:
+        if not (force or self._notify_every_check) and message == state.last_notice:
             return
         state.last_notice = message
         if state.account_id:
@@ -328,5 +356,7 @@ class Purchaser:
             lines.append("Order complete. No more purchases will be made.")
         elif message:
             lines.append(message)
+        if lines and balance is not None:
+            lines.append(f"Razer Gold left: {balance:.2f}")
         if lines:
             await self._notify("\n\n".join(lines))

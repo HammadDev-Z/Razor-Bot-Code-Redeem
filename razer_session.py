@@ -246,6 +246,18 @@ class RazerSessionManager:
             return await session.context.storage_state()
         return None
 
+    async def current_balance(self, session: RazerAccountSession) -> float | None:
+        """Razer Gold balance (USD) in the header of the session's current page.
+
+        Read at the end of a check, so it reflects what the purchases left.
+        None when the page shows no balance (e.g. it is not on gold.razer.com).
+        """
+        if session.page.is_closed():
+            return None
+        with contextlib.suppress(Exception):
+            return await self._read_gold_balance(session.page)
+        return None
+
     async def close(self, session: RazerAccountSession) -> dict[str, Any] | None:
         """Close the context and return its cookies for the next check."""
         storage_state = await self.export_storage_state(session)
@@ -486,6 +498,7 @@ class RazerSessionManager:
 
         razer_gold = await self._find_razer_gold_payment(page, timeout_ms=15_000)
         if razer_gold is None:
+            await self._snapshot(page, "no-payment-method", force=True)
             raise RazerLoginError("Razer Gold payment method was not found.")
         await self._click_text_control(razer_gold)
         await self._snapshot(page, "payment-selected")
@@ -1225,13 +1238,18 @@ class RazerSessionManager:
             context, self._email_selectors(), timeout_ms=2_000
         )
         if email_input is None:
-            await self._click_login(page)
+            try:
+                await self._click_login(page)
+            except RazerLoginError:
+                await self._snapshot_context(context, "no-login-button")
+                raise
             email_input = await self._find_visible(
                 context,
                 self._email_selectors(),
                 timeout_ms=self.login_timeout_ms,
             )
         if email_input is None:
+            await self._snapshot_context(context, "no-email-field")
             raise RazerLoginError("Razer ID email field was not found.")
 
         page = email_input.page

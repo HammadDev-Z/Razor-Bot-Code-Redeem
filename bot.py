@@ -290,7 +290,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = [f"Account: {state.email or 'none'}"]
     lines.append("Order:\n" + (progress_text(state) or "none"))
     lines.append(f"Backup codes left: {len(state.backup_codes)}")
-    balance = "unknown" if state.last_balance is None else f"{state.last_balance:g}"
+    balance = "unknown" if state.last_balance is None else f"{state.last_balance:.2f}"
     lines.append(f"Razer Gold (last seen): {balance}")
     lines.append(f"Last check: {state.last_check_at or 'never'}")
     jobs = context.job_queue.get_jobs_by_name(CHECK_JOB_NAME) if context.job_queue else []
@@ -441,6 +441,8 @@ def build_application() -> Application:
         notify,
         interval_minutes,
         refresh_at=int(os.getenv("BACKUP_CODES_REFRESH_AT", "2")),
+        notify_every_check=os.getenv("NOTIFY_EVERY_CHECK", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
     )
 
     cancel = CommandHandler("cancel", cancel_conversation)
