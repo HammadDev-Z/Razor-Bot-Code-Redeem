@@ -19,6 +19,12 @@ Copy-Item .env.example .env   # set TELEGRAM_BOT_TOKEN, BOT_OWNER_ID, BOT_SECRET
 .\.venv\Scripts\python.exe .\bot.py
 ```
 
+Production runs on the VPS with Docker, the same way as the sibling YLBots projects:
+- The code is in `/root/Razor-Bot-Code-Redeem`. Deploy with `git pull && sudo docker compose up -d --build`, and check with `sudo docker compose logs -f bot`.
+- `docker-compose.yml` forces `RAZER_HEADLESS=true`.
+- State is kept in the `bot-data` volume (`/app/data`) and snapshots in `bot-debug` (`/app/debug`). Never suggest `down -v`.
+- Only one instance may poll the bot token at a time, so the PC and the VPS can't both run it.
+
 There is no test suite or linter. `store.parse_order`, `bot._parse_backup_codes` and `StateStore` can be exercised offline. Everything in `razer_session.py` can only be verified against the live Razer site. `RAZER_HEADLESS=false` shows the browser, and `RAZER_DEBUG_SNAPSHOTS=true` saves a screenshot and HTML of each purchase step to `debug/`.
 
 ## Architecture
@@ -38,6 +44,13 @@ There is no test suite or linter. `store.parse_order`, `bot._parse_backup_codes`
 - **Never trust a product click.** Shortly after the page loads, Razer re-selects the previously bought product, which once undid the click and bought USD 5 instead of USD 2.
   - `_select_product` re-clicks until exactly the target tile has stayed `.selection-tile__content.selected` for 1.5s.
   - `_verify_selected` checks again just before `mark_pending`/CHECKOUT.
+- **Automatic backup-code refresh.**
+  - Before each purchase, if `len(backup_codes) <= BACKUP_CODES_REFRESH_AT` (default 2), `Purchaser._refresh_codes` runs once per check. It calls `refresh_backup_codes`, which opens Razer ID in a new tab and goes to profile → Backup Codes → (2-step with one stored code) → generate → (confirm in a dialog) → read the new codes. Razer ID has its own login, separate from Gold's.
+  - New codes count only once generate has been clicked, and every code already on screen at that moment is excluded.
+  - A plain `RazerLoginError` means nothing changed: the old codes are kept, and the last one is held in reserve so the next refresh can verify.
+  - `BackupCodesUnreadableError` means generate was clicked but the codes couldn't be read. The saved codes are cleared and the bot pauses.
+  - Refresh snapshots are always saved, as `debug/*-codes-*`.
+- 2-step helpers take an `OtpScope`: the OTP iframe (only while visible), or a visible dialog showing 2-step text. They search for options and inputs only inside that scope, never across the whole page.
 - **Count the receipt, not the intent.** `_receipt_product` reads "Thank you for your order of X!" with `textContent`. The purchaser credits X, and if X isn't the intended product it sets `state.paused`. `/checknow` or a new `/order` clears the pause.
 - Order items are bought strictly in sequence. A cheaper later item is never bought ahead of an unfinished earlier one.
 - `PRODUCTS_BY_CODE` in `razer_session.py` is the only allowlist of products that can be bought.

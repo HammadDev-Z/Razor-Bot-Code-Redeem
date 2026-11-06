@@ -1,0 +1,26 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      # A server has no screen, so the browser must run headless here even if
+      # .env says otherwise (it is false on the Windows PC for watching).
+      RAZER_HEADLESS: "true"
+      TZ: ${TZ:-UTC}
+    restart: unless-stopped
+    init: true
+    # Time for a running check to stop cleanly. If it is killed mid-purchase,
+    # the pending record makes the bot ask for /resolve instead of re-buying.
+    stop_grace_period: 60s
+    volumes:
+      - bot-data:/app/data
+      - bot-debug:/app/debug
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 1gb
+
+volumes:
+  # Encrypted login, backup codes, order and progress. `docker compose down -v`
+  # deletes it; plain `down` / `up -d --build` keep it.
+  bot-data:
+  bot-debug:

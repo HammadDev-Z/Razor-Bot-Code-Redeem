@@ -30,6 +30,43 @@ Run:
 .\.venv\Scripts\python.exe .\bot.py
 ```
 
+## VPS (Docker)
+
+Same setup as the other YLBots bots. Code lives in `/root/Razor-Bot-Code-Redeem`.
+
+First time:
+
+```bash
+cd /root
+git clone https://github.com/HammadDev-Z/Razor-Bot-Code-Redeem.git
+cd Razor-Bot-Code-Redeem
+cp .env.example .env
+nano .env
+sudo docker compose up -d --build
+sudo docker compose logs -f bot
+```
+
+In `nano .env` set `TELEGRAM_BOT_TOKEN`, `BOT_OWNER_ID`, `BOT_SECRET_KEY` and
+`TZ`. The browser always runs headless in Docker. When the logs show
+`Application started`, send `/newaccount` and `/order` in Telegram.
+
+Update after code changes:
+
+```bash
+cd /root/Razor-Bot-Code-Redeem
+git pull
+sudo docker compose up -d --build
+```
+
+- Run the bot in **one place only**. Stop it on the PC before starting it on the
+  VPS, or Telegram rejects one of them.
+- The encrypted login, codes and order live in the `bot-data` volume. Never run
+  `docker compose down -v`; it deletes that volume.
+- Snapshots (including backup-code refreshes) are in the `bot-debug` volume.
+  Copy them out with `sudo docker compose cp bot:/app/debug ./debug`.
+- If Razer asks for CAPTCHA or extra verification from the new server, the bot
+  messages you; that needs a visible browser once (ask before working around it).
+
 ## Commands
 
 | Command | What it does |
@@ -43,6 +80,11 @@ Run:
 | `/cancel` | Delete the account, saved login, codes, order and progress |
 
 Product codes: `830`, `2320`, `5k`, `13k`, `27k`, `56k` (USD 2, 5, 10, 25, 50, 100).
+
+When 2 backup codes are left (`BACKUP_CODES_REFRESH_AT`), the bot logs in to
+Razer ID, generates a new set of backup codes and saves them. The old codes stop
+working. If it ever can't read the new codes, it pauses and asks you to send them
+with `/addcodes`.
 
 If the bot types a backup code but cannot confirm the purchase result, it pauses
 and asks you to check your Razer transaction history and `/resolve`, so it never

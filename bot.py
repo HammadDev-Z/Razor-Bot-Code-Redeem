@@ -436,7 +436,11 @@ def build_application() -> Application:
     application.bot_data["store"] = store
     application.bot_data["sessions"] = sessions
     application.bot_data["purchaser"] = Purchaser(
-        store, sessions, notify, interval_minutes
+        store,
+        sessions,
+        notify,
+        interval_minutes,
+        refresh_at=int(os.getenv("BACKUP_CODES_REFRESH_AT", "2")),
     )
 
     cancel = CommandHandler("cancel", cancel_conversation)

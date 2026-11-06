@@ -7,8 +7,10 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from razer_session import (
+    BackupCodesUnreadableError,
     InvalidCredentialsError,
     PurchaseOutcome,
+    RazerAccountSession,
     RazerLoginError,
     RazerSessionManager,
     VerificationRequiredError,
@@ -67,11 +69,14 @@ class Purchaser:
         sessions: RazerSessionManager,
         notify: Notify,
         interval_minutes: int,
+        refresh_at: int = 2,
     ) -> None:
         self._store = store
         self._sessions = sessions
         self._notify = notify
         self._interval_minutes = interval_minutes
+        # Get new backup codes from Razer ID once this few (or fewer) are left.
+        self._refresh_at = refresh_at
         self._lock = asyncio.Lock()
 
     @property
@@ -91,6 +96,62 @@ class Purchaser:
                     "It will retry at the next check.",
                     force=True,
                 )
+
+    async def _refresh_codes(self, session: RazerAccountSession, account_id: str) -> bool:
+        """Get a new set of backup codes from Razer ID. True on success."""
+        state = self._current(account_id)
+        if state is None:
+            return False
+
+        async def take_code() -> str:
+            live = self._current(account_id)
+            if live is None or not live.backup_codes:
+                raise RazerLoginError("No backup code is left to verify with.")
+            code = live.backup_codes.pop(0)
+            self._store.save()
+            return code
+
+        try:
+            codes = await self._sessions.refresh_backup_codes(
+                session,
+                state.email,
+                state.password,
+                list(state.backup_codes),
+                take_code,
+            )
+        except BackupCodesUnreadableError as exc:
+            if (live := self._current(account_id)) is not None:
+                # The old codes were most likely replaced on Razer's side.
+                live.backup_codes = []
+                live.paused = (
+                    f"New backup codes were requested on Razer ID but could not be "
+                    f"read ({exc}), so the saved ones probably no longer work. Open "
+                    "Razer ID > Backup Codes, send the codes shown there with "
+                    "/addcodes, then /checknow."
+                )
+                self._store.save()
+                await self._notify(live.paused)
+            return False
+        except RazerLoginError as exc:
+            live = self._current(account_id)
+            left = len(live.backup_codes) if live else 0
+            await self._report(
+                f"Could not get new backup codes: {exc} The saved codes still work "
+                f"({left} left). Trying again at the next check.",
+                force=False,
+            )
+            return False
+
+        if (live := self._current(account_id)) is None:
+            return False
+        live.backup_codes = codes
+        self._store.save()
+        logger.info("Saved %s new backup codes", len(codes))
+        await self._notify(
+            f"Got {len(codes)} new backup codes from Razer ID and saved them. "
+            "The old codes no longer work."
+        )
+        return True
 
     def _current(self, account_id: str) -> BotState | None:
         """The live state, or None if the account was replaced or deleted."""
@@ -138,6 +199,7 @@ class Purchaser:
             state.last_balance = session.balance
             self._store.save()
 
+            refresh_tried = refresh_failed = False
             while True:
                 if (state := self._current(account_id)) is None:
                     return
@@ -145,6 +207,17 @@ class Purchaser:
                 reason = blocked_reason(state)
                 if item is None or reason:
                     stop_message = reason or ""
+                    break
+                if not refresh_tried and len(state.backup_codes) <= self._refresh_at:
+                    refresh_tried = True
+                    refresh_failed = not await self._refresh_codes(session, account_id)
+                    continue  # re-read the state: codes replaced, or paused
+                if refresh_failed and len(state.backup_codes) <= 1:
+                    stop_message = (
+                        "Keeping the last backup code for the next backup-code "
+                        "refresh, so buying waits until that works. Trying again "
+                        "at the next check."
+                    )
                     break
 
                 async def mark_pending(code: str = item.code) -> None:

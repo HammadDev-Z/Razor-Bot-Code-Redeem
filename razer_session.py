@@ -49,10 +49,36 @@ _CHOOSE_METHOD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _TWO_STEP_PATTERN = re.compile(
-    r"(?i)(2-step\s+authentication|"
+    r"(?i)(2-step\s+(?:authentication|verification)|"
     r"choose\s+(?:a\s+different|another)(?:\s+verification)?\s+method)"
 )
 _BACKUP_OPTION_PATTERN = re.compile(r"backup\s+codes?", re.IGNORECASE)
+RAZER_ID_URL = "https://razerid.razer.com/"
+_SECURITY_SECTION_PATTERN = re.compile(
+    r"^\s*(security|account\s+security|security\s+settings|two[- ]step|2[- ]step)\b",
+    re.IGNORECASE,
+)
+_GENERATE_CODES_PATTERN = re.compile(
+    r"(re)?generate|get\s+new\s+codes|new\s+(backup\s+)?codes", re.IGNORECASE
+)
+_CONFIRM_BUTTON_PATTERN = re.compile(
+    r"^\s*(yes|confirm|continue|ok|proceed|generate|regenerate)\b", re.IGNORECASE
+)
+# A backup code as shown on screen: 8 letters/digits, optionally "1234 5678"
+# or "1234-5678". At least two digits, so ordinary 8-letter words never count.
+_CODE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9])([A-Za-z0-9]{4})[ \-]?([A-Za-z0-9]{4})(?![A-Za-z0-9])"
+)
+
+
+def _code_tokens(text: str) -> list[str]:
+    """Backup-code-looking tokens in page text, upper-cased, in order, unique."""
+    tokens: list[str] = []
+    for match in _CODE_TOKEN.finditer(text):
+        token = (match.group(1) + match.group(2)).upper()
+        if sum(ch.isdigit() for ch in token) >= 2 and token not in tokens:
+            tokens.append(token)
+    return tokens
 # With too little Gold, Razer swaps CHECKOUT for this button (confirmed live).
 _RELOAD_TO_CHECKOUT = (
     "[data-cs-override-id='purchase-webshop-reload-checkout-btn'], "
@@ -81,6 +107,15 @@ _CODE_REJECTED_PATTERN = re.compile(
 )
 
 
+# The 2-step box: Razer's OTP iframe, or a dialog element on the page.
+OtpScope = Frame | Locator
+_OTP_DIALOG_PATTERN = re.compile(
+    r"(2-step|two[- ]step|verification\s+code|enter\s+the\s+code|backup\s+code|"
+    r"choose\s+(?:a\s+different|another))",
+    re.IGNORECASE,
+)
+
+
 def _find_otp_frame(page: Page) -> Frame | None:
     """Razer's 2-step box is an iframe served from razerid.razer.com/otp."""
     for frame in page.frames:
@@ -99,6 +134,14 @@ class InvalidCredentialsError(RazerLoginError):
 
 class VerificationRequiredError(RazerLoginError):
     """Razer requires CAPTCHA, OTP, or another interactive check."""
+
+
+class BackupCodesUnreadableError(RazerLoginError):
+    """New backup codes were requested but could not be read.
+
+    The old codes have probably stopped working, unlike a plain
+    RazerLoginError from refresh_backup_codes, which means nothing changed.
+    """
 
 
 class PurchaseOutcome(enum.Enum):
@@ -209,6 +252,206 @@ class RazerSessionManager:
         with contextlib.suppress(PlaywrightError):
             await session.context.close()
         return storage_state
+
+    async def refresh_backup_codes(
+        self,
+        session: RazerAccountSession,
+        email: str,
+        password: str,
+        known_codes: list[str],
+        take_code: Callable[[], Awaitable[str]],
+    ) -> list[str]:
+        """Generate a new set of backup codes on Razer ID and return them.
+
+        Razer ID profile → Backup Codes → (2-step verification with one backup
+        code, if asked) → generate → (confirm, if asked) → read the new codes.
+        Runs in a new tab of the check's browser context.
+
+        Raises RazerLoginError if it failed before generate was clicked (the old
+        codes still work), or BackupCodesUnreadableError after it (they likely
+        do not). Snapshots of every step go to debug/codes-*.
+        """
+        context = session.context
+        page = await context.new_page()
+        try:
+            page = await self._open_razer_id(context, page, email, password)
+            await self._snapshot(page, "codes-1-profile", force=True)
+            item = await self._find_backup_codes_item(page)
+            if item is None:
+                await self._snapshot(page, "codes-2-not-found", force=True)
+                raise RazerLoginError(
+                    "The Backup Codes option was not found on the Razer ID profile."
+                )
+            await self._snapshot(page, "codes-2-found", force=True)
+            exclude = {code.upper() for code in known_codes}
+            exclude |= set(_code_tokens(await self._full_text(page)))
+            await self._click_text_control(item)
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 120
+            verified = generate_clicked = confirm_clicked = False
+            while loop.time() < deadline:
+                scope = await self._find_otp_scope(page)
+                if scope is not None and _TWO_STEP_PATTERN.search(
+                    await self._scope_text(scope)
+                ):
+                    if verified:
+                        raise self._refresh_error(
+                            generate_clicked, "Razer asked for 2-step verification twice."
+                        )
+                    await self._snapshot(page, "codes-3-two-step", force=True)
+                    await self._verify_with_backup_code(page, take_code)
+                    verified = True
+                    await self._snapshot(page, "codes-4-verified", force=True)
+                    continue
+
+                # Codes count as new only after generate was clicked: before
+                # that the page may list old (used or unused) codes.
+                new_codes = [
+                    code
+                    for code in _code_tokens(await self._full_text(page))
+                    if code not in exclude
+                ]
+                if generate_clicked and len(new_codes) >= 5:
+                    await page.wait_for_timeout(1_000)  # let the full list render
+                    new_codes = [
+                        code
+                        for code in _code_tokens(await self._full_text(page))
+                        if code not in exclude
+                    ]
+                    await self._snapshot(page, "codes-6-new-codes", force=True)
+                    return new_codes
+
+                if not generate_clicked:
+                    generate = await self._find_pattern(
+                        page, _GENERATE_CODES_PATTERN, timeout_ms=500
+                    )
+                    if generate is not None:
+                        await self._snapshot(page, "codes-5-generate", force=True)
+                        exclude |= set(_code_tokens(await self._full_text(page)))
+                        generate_clicked = True
+                        await self._click_text_control(generate)
+                elif not confirm_clicked:
+                    confirm = await self._find_confirm_button(page)
+                    if confirm is not None:
+                        await self._snapshot(page, "codes-5-confirm", force=True)
+                        confirm_clicked = True
+                        await self._click_text_control(confirm)
+                await asyncio.sleep(0.5)
+
+            await self._snapshot(page, "codes-timeout", force=True)
+            raise self._refresh_error(
+                generate_clicked,
+                "New codes did not appear after generating."
+                if generate_clicked
+                else "The generate-codes button did not appear.",
+            )
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            await self._snapshot(page, "codes-error", force=True)
+            raise RazerLoginError(f"Razer ID stopped responding: {exc}") from exc
+        finally:
+            with contextlib.suppress(PlaywrightError):
+                await page.close()
+
+    @staticmethod
+    def _refresh_error(generate_clicked: bool, message: str) -> RazerLoginError:
+        if generate_clicked:
+            return BackupCodesUnreadableError(message)
+        return RazerLoginError(message)
+
+    async def _verify_with_backup_code(
+        self, page: Page, take_code: Callable[[], Awaitable[str]]
+    ) -> None:
+        """Pass a 2-step prompt with one backup code (used on Razer ID)."""
+        opened = await self._open_backup_codes_menu(page)
+        if opened is None:
+            raise RazerLoginError("Backup Codes method was not found.")
+        scope, option = opened
+        await self._click_text_control(option)
+        inputs = await self._find_backup_code_inputs(scope)
+        code = await take_code()
+        await self._type_backup_code(inputs, code)
+        code = ""
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        confirm_tried = False
+        while loop.time() - started < 30:
+            scope = await self._find_otp_scope(page)
+            text = await self._scope_text(scope) if scope is not None else ""
+            if _CODE_REJECTED_PATTERN.search(text):
+                await self._snapshot(page, "codes-code-rejected", force=True)
+                raise RazerLoginError("Razer rejected the backup code.")
+            if scope is None or not re.search(r"backup\s+code", text, re.IGNORECASE):
+                return  # The 2-step box closed: verified.
+            if not confirm_tried and loop.time() - started > 5:
+                confirm_tried = True
+                await self._click_first(
+                    scope,
+                    [
+                        "button:has-text('Verify')",
+                        "button:has-text('Confirm')",
+                        "button:has-text('Submit')",
+                        "button:has-text('Continue')",
+                    ],
+                )
+            await asyncio.sleep(0.5)
+        raise RazerLoginError("2-step verification did not finish.")
+
+    async def _find_confirm_button(self, page: Page) -> Locator | None:
+        """A confirmation button inside a visible dialog (e.g. 'this replaces
+        your old codes'). Only dialogs are searched so nothing else is clicked."""
+        dialogs = page.locator("[role='dialog'], .modal.show, [aria-modal='true']")
+        with contextlib.suppress(PlaywrightError):
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                if not await dialog.is_visible():
+                    continue
+                button = await self._find_pattern(
+                    dialog, _CONFIRM_BUTTON_PATTERN, timeout_ms=300
+                )
+                if button is not None:
+                    return button
+        return None
+
+    async def _open_razer_id(
+        self, context: BrowserContext, page: Page, email: str, password: str
+    ) -> Page:
+        """Open razerid.razer.com logged in. Its session is separate from Gold's."""
+        with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+            await page.goto(RAZER_ID_URL, wait_until="domcontentloaded", timeout=60_000)
+        deadline = asyncio.get_running_loop().time() + 8
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._is_authenticated(page):
+                return page
+            await asyncio.sleep(0.25)
+        return await self._perform_login(
+            context, page, email, password, start_url=RAZER_ID_URL
+        )
+
+    async def _find_backup_codes_item(self, page: Page) -> Locator | None:
+        """Find the Backup Codes option on the profile, scrolling as needed."""
+        for _ in range(2):
+            for _ in range(8):
+                item = await self._find_pattern(
+                    page, _BACKUP_OPTION_PATTERN, timeout_ms=600
+                )
+                if item is not None:
+                    return item
+                with contextlib.suppress(PlaywrightError):
+                    await page.mouse.wheel(0, 700)
+            # Not on this page: try a Security / Account section link.
+            section = await self._find_pattern(
+                page, _SECURITY_SECTION_PATTERN, timeout_ms=1_000
+            )
+            if section is None:
+                return None
+            with contextlib.suppress(RazerLoginError):
+                await self._click_text_control(section)
+            with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+                await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            await page.wait_for_timeout(2_000)
+        return None
 
     async def purchase_one(
         self,
@@ -575,9 +818,9 @@ class RazerSessionManager:
                 parts.append(await RazerSessionManager._page_text(frame))
         return "\n".join(parts)
 
-    async def _snapshot(self, page: Page, label: str) -> None:
+    async def _snapshot(self, page: Page, label: str, *, force: bool = False) -> None:
         """Save a screenshot and the HTML when RAZER_DEBUG_SNAPSHOTS is on."""
-        if not self.snapshots_enabled:
+        if not (self.snapshots_enabled or force):
             return
         try:
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -595,29 +838,61 @@ class RazerSessionManager:
         except Exception:
             logger.warning("Could not save debug snapshot %s", label, exc_info=True)
 
-    async def _wait_for_otp_frame(self, page: Page, *, timeout_ms: int) -> Frame:
-        """Return Razer's 2-step iframe once its verification text is showing.
+    @staticmethod
+    async def _scope_text(scope: OtpScope) -> str:
+        if isinstance(scope, Frame):
+            return await RazerSessionManager._page_text(scope)
+        try:
+            return await scope.inner_text(timeout=1_500)
+        except (PlaywrightTimeoutError, PlaywrightError):
+            return ""
 
-        The 2-step box on gold.razer.com is an iframe from razerid.razer.com/otp,
-        so neither page text scans nor page-level locators can see into it.
+    @staticmethod
+    async def _find_otp_scope(page: Page) -> OtpScope | None:
+        """Where the 2-step box is: Razer's OTP iframe (as on gold.razer.com),
+        or a visible dialog on the page itself showing 2-step text.
+
+        A dialog is used rather than the whole page so that settings text such
+        as a "Backup Codes" menu entry behind it is never mistaken for the
+        2-step box's own options.
+        """
+        frame = _find_otp_frame(page)
+        if frame is not None:
+            # Razer can leave the iframe in the page, hidden, after it is done.
+            with contextlib.suppress(PlaywrightError):
+                if await (await frame.frame_element()).is_visible():
+                    return frame
+        dialogs = page.locator("[role='dialog'], .modal.show, [aria-modal='true']")
+        with contextlib.suppress(PlaywrightError):
+            for index in range(await dialogs.count()):
+                dialog = dialogs.nth(index)
+                if await dialog.is_visible() and _OTP_DIALOG_PATTERN.search(
+                    await RazerSessionManager._scope_text(dialog)
+                ):
+                    return dialog
+        return None
+
+    async def _wait_for_otp_scope(self, page: Page, *, timeout_ms: int) -> OtpScope:
+        """Return the 2-step box once its verification text is showing.
+
+        On gold.razer.com it is an iframe from razerid.razer.com/otp, so neither
+        page text scans nor page-level locators can see into it.
         """
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
         while asyncio.get_running_loop().time() < deadline:
-            frame = _find_otp_frame(page)
-            if frame is not None and _TWO_STEP_PATTERN.search(
-                await self._page_text(frame)
+            scope = await self._find_otp_scope(page)
+            if scope is not None and _TWO_STEP_PATTERN.search(
+                await self._scope_text(scope)
             ):
-                return frame
+                return scope
             await asyncio.sleep(0.2)
-        raise RazerLoginError(
-            "Two-step authentication options did not load after checkout."
-        )
+        raise RazerLoginError("Two-step authentication options did not load.")
 
     async def _open_backup_codes_menu(
         self, page: Page
-    ) -> tuple[Frame, Locator] | None:
+    ) -> tuple[OtpScope, Locator] | None:
         """Open 'Choose another verification method' and return Backup Codes."""
-        frame = await self._wait_for_otp_frame(page, timeout_ms=60_000)
+        frame = await self._wait_for_otp_scope(page, timeout_ms=60_000)
 
         async def backup_option(timeout_ms: int) -> Locator | None:
             return await self._find_pattern(
@@ -738,7 +1013,7 @@ class RazerSessionManager:
 
     @staticmethod
     async def _find_pattern(
-        scope: Page | Frame, pattern: re.Pattern[str], *, timeout_ms: int
+        scope: Page | Frame | Locator, pattern: re.Pattern[str], *, timeout_ms: int
     ) -> Locator | None:
         """Return the visible element with the shortest text matching pattern."""
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
@@ -824,40 +1099,32 @@ class RazerSessionManager:
             await asyncio.sleep(0.3)
 
     @staticmethod
-    async def _find_backup_code_inputs(frame: Frame) -> list[Locator]:
-        """Wait for the backup-code entry screen and return its visible inputs."""
-        try:
-            await frame.wait_for_function(
-                """() => {
-                    const text = document.body?.innerText || '';
-                    return /backup\\s+code/i.test(text) &&
-                        !/generated\\s+by\\s+your\\s+authenticator/i.test(text) &&
-                        [...document.querySelectorAll('input')].some(input => {
-                            const box = input.getBoundingClientRect();
-                            return box.width > 0 && box.height > 0 &&
-                                !['hidden', 'checkbox', 'radio'].includes(input.type);
-                        });
-                }""",
-                timeout=15_000,
-            )
-        except PlaywrightTimeoutError as exc:
-            raise RazerLoginError("Backup-code entry screen did not load.") from exc
+    async def _find_backup_code_inputs(scope: OtpScope) -> list[Locator]:
+        """Wait for the backup-code entry screen and return its visible inputs.
 
-        inputs = frame.locator(
-            "input:not([type='hidden']):not([type='checkbox'])"
-            ":not([type='radio']):visible"
-        )
-        visible_inputs: list[Locator] = []
-        for index in range(await inputs.count()):
-            candidate = inputs.nth(index)
-            try:
-                if await candidate.is_visible() and await candidate.is_editable():
-                    visible_inputs.append(candidate)
-            except PlaywrightError:
-                continue
-        if not visible_inputs:
-            raise RazerLoginError("Backup-code input boxes were not found.")
-        return visible_inputs
+        Only inputs inside the 2-step box (iframe or dialog) are considered, so
+        a code can never be typed into some other field on the page.
+        """
+        deadline = asyncio.get_running_loop().time() + 15
+        while asyncio.get_running_loop().time() < deadline:
+            text = await RazerSessionManager._scope_text(scope)
+            if re.search(r"backup\s+code", text, re.IGNORECASE) and not re.search(
+                r"generated\s+by\s+your\s+authenticator", text, re.IGNORECASE
+            ):
+                inputs = scope.locator(
+                    "input:not([type='hidden']):not([type='checkbox'])"
+                    ":not([type='radio']):visible"
+                )
+                visible_inputs: list[Locator] = []
+                with contextlib.suppress(PlaywrightError):
+                    for index in range(await inputs.count()):
+                        candidate = inputs.nth(index)
+                        if await candidate.is_visible() and await candidate.is_editable():
+                            visible_inputs.append(candidate)
+                if visible_inputs:
+                    return visible_inputs
+            await asyncio.sleep(0.25)
+        raise RazerLoginError("Backup-code entry screen did not load.")
 
     @staticmethod
     async def _type_backup_code(inputs: list[Locator], code: str) -> None:
@@ -936,15 +1203,17 @@ class RazerSessionManager:
         page: Page,
         email: str,
         password: str,
+        *,
+        start_url: str | None = None,
     ) -> Page:
         try:
             await page.goto(
-                self.account_url,
+                start_url or self.account_url,
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
         except PlaywrightTimeoutError as exc:
-            raise RazerLoginError("Razer Gold did not open.") from exc
+            raise RazerLoginError("Razer did not open.") from exc
 
         email_input = await self._find_visible(
             context, self._email_selectors(), timeout_ms=2_000
