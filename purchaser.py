@@ -70,7 +70,8 @@ class Purchaser:
         notify: Notify,
         interval_minutes: int,
         refresh_at: int = 2,
-        notify_every_check: bool = False,
+        notify_every_check: bool = True,
+        on_cycle_done: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._sessions = sessions
@@ -80,6 +81,9 @@ class Purchaser:
         self._refresh_at = refresh_at
         # Message after every check, even when nothing changed since the last one.
         self._notify_every_check = notify_every_check
+        # Called after every check that ran (manual or timer), e.g. to restart
+        # the countdown to the next one.
+        self._on_cycle_done = on_cycle_done
         self._lock = asyncio.Lock()
 
     @property
@@ -101,6 +105,12 @@ class Purchaser:
                     "It will retry at the next check.",
                     force=True,
                 )
+            finally:
+                if self._on_cycle_done is not None:
+                    try:
+                        self._on_cycle_done()
+                    except Exception:
+                        logger.exception("Could not reset the check timer")
 
     async def _refresh_codes(self, session: RazerAccountSession, account_id: str) -> bool:
         """Get a new set of backup codes from Razer ID. True on success."""
@@ -324,6 +334,7 @@ class Purchaser:
             force=manual or bought > 0,
             bought=bought,
             balance=balance_now,
+            stamp=True,
         )
 
     async def _report(
@@ -333,13 +344,15 @@ class Purchaser:
         force: bool,
         bought: int = 0,
         balance: float | None = None,
+        stamp: bool = False,
     ) -> None:
         """Send a status message, skipping exact repeats of the last one.
 
         The timer runs every 30 minutes; without this, "not enough Gold" would
-        be sent every half hour until the account is topped up. Set
-        NOTIFY_EVERY_CHECK=true to get a message after every check anyway.
-        ``balance`` is the Gold left, read at the end of this check.
+        be sent every half hour until the account is topped up. With
+        NOTIFY_EVERY_CHECK=true (the default) every check sends a message
+        anyway. ``balance`` is the Gold left, read at the end of this check;
+        ``stamp`` adds the check time, so a repeat is clearly a fresh check.
         """
         state = self._store.state
         if not (force or self._notify_every_check) and message == state.last_notice:
@@ -358,5 +371,7 @@ class Purchaser:
             lines.append(message)
         if lines and balance is not None:
             lines.append(f"Razer Gold left: {balance:.2f}")
+        if lines and stamp:
+            lines.insert(0, f"Check at {now_text()}")
         if lines:
             await self._notify("\n\n".join(lines))

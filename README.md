@@ -19,7 +19,9 @@ Copy-Item .env.example .env
 In `.env` set:
 
 - `TELEGRAM_BOT_TOKEN`
-- `BOT_OWNER_ID`: your numeric Telegram user ID (required; only you can use the bot)
+- `BOT_OWNER_ID`: numeric Telegram user IDs allowed to use the bot, comma-separated
+  (required), e.g. `6768446730,7376156491`. They share one account and order, and every
+  one gets all messages. Each must press Start in the bot's chat once.
 - `BOT_SECRET_KEY`: generate with
   `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.
   It encrypts the saved login in `data/`. Losing or changing it makes that data unreadable.
@@ -91,7 +93,11 @@ If the bot types a backup code but cannot confirm the purchase result, it pauses
 and asks you to check your Razer transaction history and `/resolve`, so it never
 buys twice by mistake.
 
-The bot checks every 30 minutes, but only messages you when something changed (bought, order done, a new problem), so a long wait for a top-up stays quiet. Each message ends with the Razer Gold left. `/status` shows the last and next check; set `NOTIFY_EVERY_CHECK=true` for a message after every check.
+The bot checks every 30 minutes and messages you after every check, stamped with the
+time and ending with the Razer Gold left. The 30-minute wait restarts after every check,
+including `/checknow`, so the next automatic check comes a full 30 minutes after the last
+one finished. `/status` shows the last and next check. Set
+`NOTIFY_EVERY_CHECK=false` to hear only about changes (bought, order done, a new problem).
 
 If Razer requires a visible CAPTCHA or verification step, set
 `RAZER_HEADLESS=false` and restart.

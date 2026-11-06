@@ -4,6 +4,7 @@ import contextlib
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -58,15 +59,17 @@ def _purchaser(context: ContextTypes.DEFAULT_TYPE) -> Purchaser:
     return context.application.bot_data["purchaser"]
 
 
-def _owner_id() -> int:
-    value = os.getenv("BOT_OWNER_ID", "").strip()
-    if not value.isdigit():
+def _owner_ids() -> frozenset[int]:
+    """Telegram user IDs allowed to use the bot: BOT_OWNER_ID, comma-separated."""
+    parts = [part.strip() for part in os.getenv("BOT_OWNER_ID", "").split(",")]
+    parts = [part for part in parts if part]
+    if not parts or not all(part.isdigit() for part in parts):
         raise RuntimeError(
-            "BOT_OWNER_ID must be set in .env to your numeric Telegram user ID. "
-            "The bot saves a Razer login and buys automatically, so it cannot "
-            "be left open to everyone."
+            "BOT_OWNER_ID must be set in .env to numeric Telegram user IDs, "
+            "separated by commas (e.g. 111,222). The bot saves a Razer login "
+            "and buys automatically, so it cannot be left open to everyone."
         )
-    return int(value)
+    return frozenset(int(part) for part in parts)
 
 
 async def _reject_if_needed(update: Update) -> bool:
@@ -78,7 +81,7 @@ async def _reject_if_needed(update: Update) -> bool:
     if chat.type != "private":
         await message.reply_text("Use this bot only in a private chat.")
         return True
-    if user.id != _owner_id():
+    if user.id not in _owner_ids():
         await message.reply_text("You are not authorized to use this bot.")
         return True
     return False
@@ -295,7 +298,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines.append(f"Last check: {state.last_check_at or 'never'}")
     jobs = context.job_queue.get_jobs_by_name(CHECK_JOB_NAME) if context.job_queue else []
     if jobs and jobs[0].next_t:
-        lines.append(f"Next check: {jobs[0].next_t.astimezone():%Y-%m-%d %H:%M}")
+        lines.append(f"Next check: {jobs[0].next_t.astimezone():%Y-%m-%d %H:%M %Z}")
     if purchaser.running:
         lines.append("State: a check is running now.")
     else:
@@ -407,7 +410,7 @@ def build_application() -> Application:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env")
-    owner_id = _owner_id()
+    owner_ids = _owner_ids()
     interval_minutes = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 
     builder = (
@@ -426,22 +429,37 @@ def build_application() -> Application:
         )
 
     async def notify(text: str) -> None:
-        try:
-            await application.bot.send_message(owner_id, text)
-        except TelegramError:
-            logger.exception("Could not send a notification")
+        # Everyone listed gets every message. One person who has not started
+        # the bot yet (Telegram refuses) must not stop the others getting it.
+        for owner_id in sorted(owner_ids):
+            try:
+                await application.bot.send_message(owner_id, text)
+            except TelegramError:
+                logger.exception("Could not send a notification to %s", owner_id)
 
     store = StateStore.from_env()
     sessions = RazerSessionManager()
     application.bot_data["store"] = store
     application.bot_data["sessions"] = sessions
+    def restart_check_timer() -> None:
+        """Next automatic check = one full interval after this check ended.
+
+        Called after every check, so a /checknow (or any manual check) also
+        pushes the timer back instead of letting it fire soon after.
+        """
+        assert application.job_queue is not None
+        due = datetime.now(timezone.utc) + timedelta(minutes=interval_minutes)
+        for job in application.job_queue.get_jobs_by_name(CHECK_JOB_NAME):
+            job.job.modify(next_run_time=due)
+
     application.bot_data["purchaser"] = Purchaser(
         store,
         sessions,
         notify,
         interval_minutes,
+        on_cycle_done=restart_check_timer,
         refresh_at=int(os.getenv("BACKUP_CODES_REFRESH_AT", "2")),
-        notify_every_check=os.getenv("NOTIFY_EVERY_CHECK", "false").strip().lower()
+        notify_every_check=os.getenv("NOTIFY_EVERY_CHECK", "true").strip().lower()
         in {"1", "true", "yes", "on"},
     )
 

@@ -222,4 +222,4 @@ def parse_order(text: str) -> list[OrderItem]:
 
 
 def now_text() -> str:
-    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
