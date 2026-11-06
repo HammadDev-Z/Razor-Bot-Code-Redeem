@@ -62,6 +62,53 @@ def progress_text(state: BotState) -> str:
     )
 
 
+_MESSAGE_LIMIT = 3500  # Telegram's cap is 4096 characters
+
+
+def codes_messages(state: BotState, title: str) -> list[str]:
+    """The saved PINs, one message per ~3500 characters, under a heading per product.
+
+    Empty when no PIN is saved. Codes bought before PINs were saved (or whose
+    PIN could not be read) are counted in a note, never invented.
+    """
+    blocks: list[tuple[str, list[str]]] = []
+    missing = 0
+    for item in state.order:
+        pins = state.pins.get(item.code, [])
+        missing += max(item.done - len(pins), 0)
+        if pins:
+            heading = (
+                f"{item.product.removeprefix('Yalla Ludo - ')} "
+                f"({item.code}): {len(pins)} {'code' if len(pins) == 1 else 'codes'}"
+            )
+            blocks.append((heading, pins))
+    if not blocks:
+        return []
+
+    messages: list[str] = []
+    current = [title]
+    size = len(title)
+    for heading, pins in blocks:
+        current += ["", heading]
+        size += len(heading) + 2
+        for pin in pins:
+            if size + len(pin) + 1 > _MESSAGE_LIMIT:
+                messages.append("\n".join(current))
+                current = [f"{heading} (continued)"]
+                size = len(current[0])
+            current.append(pin)
+            size += len(pin) + 1
+    if missing:
+        current.append("")
+        current.append(
+            f"Not listed: {missing} bought without a saved code (before codes were "
+            "saved, or the receipt could not be read). They are in your Razer "
+            "email and transaction history."
+        )
+    messages.append("\n".join(current))
+    return messages
+
+
 class Purchaser:
     def __init__(
         self,
@@ -269,6 +316,13 @@ class Purchaser:
                     credited = state.find_item_by_product(actual)
                     if credited is not None:
                         credited.done += 1
+                        pin = getattr(session, "last_pin", None)
+                        if pin:
+                            saved = state.pins.setdefault(credited.code, [])
+                            if pin not in saved:
+                                saved.append(pin)
+                        else:
+                            logger.warning("No PIN could be read for %s", actual)
                     state.pending = None
                     bought += 1
                     logger.info("Bought %s (%s total this check)", actual, bought)
@@ -336,6 +390,10 @@ class Purchaser:
             balance=balance_now,
             stamp=True,
         )
+        # The order was finished by this check: hand over every code.
+        if bought and (live := self._current(account_id)) is not None and live.order_complete:
+            for text in codes_messages(live, "Order complete. All codes:"):
+                await self._notify(text)
 
     async def _report(
         self,
@@ -348,7 +406,7 @@ class Purchaser:
     ) -> None:
         """Send a status message, skipping exact repeats of the last one.
 
-        The timer runs every 30 minutes; without this, "not enough Gold" would
+        The timer runs every 20 minutes; without this, "not enough Gold" would
         be sent every half hour until the account is topped up. With
         NOTIFY_EVERY_CHECK=true (the default) every check sends a message
         anyway. ``balance`` is the Gold left, read at the end of this check;

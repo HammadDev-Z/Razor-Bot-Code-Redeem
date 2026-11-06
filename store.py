@@ -57,6 +57,9 @@ class BotState:
     last_balance: float | None = None
     last_check_at: str = ""
     last_notice: str = ""
+    # Product PINs read from the receipts, per order item code, in purchase order.
+    # Belong to the current order: a new /order clears them.
+    pins: dict[str, list[str]] = field(default_factory=dict)
 
     @property
     def has_account(self) -> bool:
@@ -105,6 +108,11 @@ class BotState:
             last_balance=data.get("last_balance"),
             last_check_at=data.get("last_check_at", ""),
             last_notice=data.get("last_notice", ""),
+            pins={
+                code: list(pins)
+                for code, pins in (data.get("pins") or {}).items()
+                if code in PRODUCTS_BY_CODE
+            },
         )
 
 
@@ -160,6 +168,7 @@ class StateStore:
             backup_codes=list(dict.fromkeys(codes)),
             order=old.order,
             pending=old.pending,
+            pins=old.pins,
         )
         self.save()
 
@@ -171,7 +180,9 @@ class StateStore:
         return len(added)
 
     def set_order(self, items: list[OrderItem]) -> None:
+        # A new order cancels the previous one, including its saved PINs.
         self.state.order = items
+        self.state.pins = {}
         self.state.paused = ""
         self.state.last_notice = ""
         self.save()

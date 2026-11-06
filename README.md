@@ -1,6 +1,6 @@
 # Razer Bot Code Redeem
 
-Telegram bot that keeps one Razer account on file and, every 30 minutes, buys
+Telegram bot that keeps one Razer account on file and, every 20 minutes, buys
 Yalla Ludo Diamonds with Razer Gold until a set order is finished. When the Gold
 runs out it waits, and continues where it left off after the account is topped up.
 
@@ -78,11 +78,18 @@ sudo docker compose up -d --build
 | `/order 830x30 2320x20` | Set the order; items are bought strictly in the order given |
 | `/status` | Progress, backup codes left, last Gold balance, next check |
 | `/checknow` | Run a check immediately |
+| `/codes` | Resend the product codes (PINs) bought so far for this order |
 | `/addcodes` | Add more backup codes (each purchase uses one) |
 | `/resolve bought` / `/resolve notbought` | Settle a purchase whose result could not be confirmed |
 | `/cancel` | Delete the account, saved login, codes, order and progress |
 
 Product codes: `830`, `2320`, `5k`, `13k`, `27k`, `56k` (USD 2, 5, 10, 25, 50, 100).
+
+Every purchase's product code (the PIN on Razer's receipt) is saved with the order. When
+the order is finished the bot sends them all in a new message, one heading per product
+(split into several messages if long). `/codes` sends them again at any time. A new
+`/order` cancels the previous order and its saved codes; the bot sends that old order's
+codes first so none are lost.
 
 When 2 backup codes are left (`BACKUP_CODES_REFRESH_AT`), the bot logs in to
 Razer ID, generates a new set of backup codes and saves them. The old codes stop
@@ -93,9 +100,9 @@ If the bot types a backup code but cannot confirm the purchase result, it pauses
 and asks you to check your Razer transaction history and `/resolve`, so it never
 buys twice by mistake.
 
-The bot checks every 30 minutes and messages you after every check, stamped with the
-time and ending with the Razer Gold left. The 30-minute wait restarts after every check,
-including `/checknow`, so the next automatic check comes a full 30 minutes after the last
+The bot checks every 20 minutes and messages you after every check, stamped with the
+time and ending with the Razer Gold left. The 20-minute wait restarts after every check,
+including `/checknow`, so the next automatic check comes a full 20 minutes after the last
 one finished. `/status` shows the last and next check. Set
 `NOTIFY_EVERY_CHECK=false` to hear only about changes (bought, order done, a new problem).
 

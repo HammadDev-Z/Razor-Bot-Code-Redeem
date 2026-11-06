@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from purchaser import Purchaser, blocked_reason, progress_text
+from purchaser import Purchaser, blocked_reason, codes_messages, progress_text
 from razer_session import PRODUCTS_BY_CODE, RazerSessionManager
 from store import StateStore, parse_order
 
@@ -41,8 +41,9 @@ EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 CHECK_JOB_NAME = "purchase-check"
 HELP_TEXT = (
     "/newaccount - save Razer email, password and backup codes\n"
-    "/order 830x30 2320x20 - set what to buy, in that order\n"
+    "/order 830x30 2320x20 - set what to buy, in that order (replaces the old order)\n"
     "/status - progress, codes left, next check\n"
+    "/codes - the product codes bought so far for this order\n"
     "/checknow - check right now instead of waiting\n"
     "/addcodes - add more backup codes\n"
     "/resolve bought|notbought - settle an unconfirmed purchase\n"
@@ -275,14 +276,35 @@ async def order_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Product codes: {', '.join(PRODUCTS_BY_CODE)}"
         )
         return
+    # A new order cancels the previous one and its saved product codes. Hand
+    # over any codes it collected first, so none are lost with it.
+    previous = progress_text(store.state)
+    for text in codes_messages(
+        store.state, "Codes from the previous order (cancelled by the new order):"
+    ):
+        await update.effective_message.reply_text(text)
     store.set_order(items)
-    reply = "Order set, bought in this order:\n" + progress_text(store.state)
+    reply = ""
+    if previous:
+        reply = "Previous order cancelled:\n" + previous + "\n\n"
+    reply += "New order, bought in this order:\n" + progress_text(store.state)
     if blocked_reason(store.state) is None:
         reply += "\n\nStarting a check now."
         _start_check(context)
     elif not store.state.has_account:
         reply += "\n\nNow add the account with /newaccount."
     await update.effective_message.reply_text(reply)
+
+
+async def codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await _reject_if_needed(update):
+        return
+    messages = codes_messages(_store(context).state, "Codes bought for this order:")
+    if not messages:
+        await update.effective_message.reply_text("No product codes saved yet.")
+        return
+    for text in messages:
+        await update.effective_message.reply_text(text)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -411,7 +433,7 @@ def build_application() -> Application:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from .env")
     owner_ids = _owner_ids()
-    interval_minutes = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
+    interval_minutes = int(os.getenv("CHECK_INTERVAL_MINUTES", "20"))
 
     builder = (
         ApplicationBuilder()
@@ -488,6 +510,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("order", order_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("codes", codes_command))
     application.add_handler(CommandHandler("checknow", checknow_command))
     application.add_handler(CommandHandler("resolve", resolve_command))
 

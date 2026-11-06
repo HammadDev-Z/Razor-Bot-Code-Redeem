@@ -54,6 +54,11 @@ _TWO_STEP_PATTERN = re.compile(
 )
 _BACKUP_OPTION_PATTERN = re.compile(r"backup\s+codes?", re.IGNORECASE)
 RAZER_ID_URL = "https://razerid.razer.com/"
+# Confirmed live: the Account page lists Log In and Security settings, with a
+# "Backup Codes" row that opens /account/security/codes (GENERATE NEW CODES,
+# then a dialog whose button is GET NEW CODES).
+RAZER_ID_ACCOUNT_URL = "https://razerid.razer.com/account"
+RAZER_ID_CODES_URL = "https://razerid.razer.com/account/security/codes"
 _SECURITY_SECTION_PATTERN = re.compile(
     r"^\s*(security|account\s+security|security\s+settings|two[- ]step|2[- ]step)\b",
     re.IGNORECASE,
@@ -62,7 +67,8 @@ _GENERATE_CODES_PATTERN = re.compile(
     r"(re)?generate|get\s+new\s+codes|new\s+(backup\s+)?codes", re.IGNORECASE
 )
 _CONFIRM_BUTTON_PATTERN = re.compile(
-    r"^\s*(yes|confirm|continue|ok|proceed|generate|regenerate)\b", re.IGNORECASE
+    r"^\s*(yes|confirm|continue|ok|proceed|generate|regenerate|get\s+new\s+codes)\b",
+    re.IGNORECASE,
 )
 # A backup code as shown on screen: 8 letters/digits, optionally "1234 5678"
 # or "1234-5678". At least two digits, so ordinary 8-letter words never count.
@@ -162,6 +168,8 @@ class RazerAccountSession:
     on_product_menu: bool = True
     # Product named on the last receipt, or None if it could not be read.
     last_purchased: str | None = None
+    # Product PIN shown on the last receipt, or None if it could not be read.
+    last_pin: str | None = None
 
 
 class RazerSessionManager:
@@ -287,6 +295,12 @@ class RazerSessionManager:
         page = await context.new_page()
         try:
             page = await self._open_razer_id(context, page, email, password)
+            # The login lands on the Dashboard; the Backup Codes row is on Account.
+            with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+                await page.goto(
+                    RAZER_ID_ACCOUNT_URL, wait_until="domcontentloaded", timeout=60_000
+                )
+            await self._dismiss_cookie_banner(page)
             await self._snapshot(page, "codes-1-profile", force=True)
             await self._dismiss_cookie_banner(page)
             item = await self._find_backup_codes_item(page)
@@ -303,6 +317,8 @@ class RazerSessionManager:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 120
             verified = generate_clicked = confirm_clicked = False
+            verified_at = 0.0
+            revisited = False
             while loop.time() < deadline:
                 scope = await self._find_otp_scope(page)
                 if scope is not None and _TWO_STEP_PATTERN.search(
@@ -315,7 +331,26 @@ class RazerSessionManager:
                     await self._snapshot(page, "codes-3-two-step", force=True)
                     await self._verify_with_backup_code(page, take_code)
                     verified = True
+                    verified_at = loop.time()
                     await self._snapshot(page, "codes-4-verified", force=True)
+                    continue
+
+                # Verified but still not on the codes page: open it directly.
+                if (
+                    verified
+                    and not generate_clicked
+                    and not revisited
+                    and "security/codes" not in page.url
+                    and loop.time() - verified_at > 6
+                ):
+                    revisited = True
+                    with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+                        await page.goto(
+                            RAZER_ID_CODES_URL,
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                    await self._dismiss_cookie_banner(page)
                     continue
 
                 # Codes count as new only after generate was clicked: before
@@ -425,7 +460,13 @@ class RazerSessionManager:
                 )
                 if button is not None:
                     return button
-        return None
+        # Razer's dialog is not marked as one: look for its exact button
+        # (confirmed live: "GET NEW CODES") anywhere on the page.
+        return await self._find_pattern(
+            page,
+            re.compile(r"^\s*get\s+new\s+codes\s*$", re.IGNORECASE),
+            timeout_ms=300,
+        )
 
     async def _open_razer_id(
         self, context: BrowserContext, page: Page, email: str, password: str
@@ -444,8 +485,15 @@ class RazerSessionManager:
         )
 
     async def _find_backup_codes_item(self, page: Page) -> Locator | None:
-        """Find the Backup Codes option on the profile, scrolling as needed."""
-        for _ in range(2):
+        """Find the Backup Codes option, scrolling and following Security links.
+
+        Razer ID keeps it under Security > 2-Step Authentication, so up to
+        three section links are followed (each only once).
+        """
+        clicked: set[str] = set()
+        for _ in range(4):
+            # The profile is a single-page app: give it time to render.
+            await page.wait_for_timeout(1_500)
             for _ in range(8):
                 item = await self._find_pattern(
                     page, _BACKUP_OPTION_PATTERN, timeout_ms=600
@@ -454,17 +502,25 @@ class RazerSessionManager:
                     return item
                 with contextlib.suppress(PlaywrightError):
                     await page.mouse.wheel(0, 700)
-            # Not on this page: try a Security / Account section link.
+            with contextlib.suppress(PlaywrightError):
+                await page.evaluate("window.scrollTo(0, 0)")
             section = await self._find_pattern(
                 page, _SECURITY_SECTION_PATTERN, timeout_ms=1_000
             )
             if section is None:
                 return None
+            label = ""
+            with contextlib.suppress(PlaywrightError):
+                label = " ".join((await section.inner_text(timeout=1_000)).split())
+            if label.casefold() in clicked:
+                return None
+            clicked.add(label.casefold())
             with contextlib.suppress(RazerLoginError):
                 await self._click_text_control(section)
             with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
                 await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-            await page.wait_for_timeout(2_000)
+            await self._dismiss_cookie_banner(page)
+            await self._snapshot(page, f"codes-1b-after-{len(clicked)}", force=True)
         return None
 
     async def purchase_one(
@@ -492,6 +548,7 @@ class RazerSessionManager:
         await self._show_product_menu(session)
         session.on_product_menu = False
         session.last_purchased = None
+        session.last_pin = None
         page = session.page
         await self._dismiss_cookie_banner(page)
         await self._select_product(page, product_name)
@@ -530,6 +587,9 @@ class RazerSessionManager:
         if stage == "success":
             await self._snapshot(page, "success-no-2fa")
             session.last_purchased = await self._receipt_product(page)
+            session.last_pin = await self._receipt_pin(page)
+            if session.last_pin is None:
+                await self._snapshot(page, "success-no-pin", force=True)
             return PurchaseOutcome.SUCCESS
         if stage == "insufficient":
             await self._snapshot(page, "insufficient")
@@ -745,6 +805,9 @@ class RazerSessionManager:
                     session.page = candidate
                     await self._snapshot(candidate, "success")
                     session.last_purchased = await self._receipt_product(candidate)
+                    session.last_pin = await self._receipt_pin(candidate)
+                    if session.last_pin is None:
+                        await self._snapshot(candidate, "success-no-pin", force=True)
                     return PurchaseOutcome.SUCCESS
                 if _CODE_REJECTED_PATTERN.search(text):
                     await self._snapshot(candidate, "code-rejected")
@@ -817,6 +880,32 @@ class RazerSessionManager:
             )
             if match:
                 return re.sub(r"\s+", " ", match.group(1)).strip()
+            await asyncio.sleep(0.5)
+        return None
+
+    @staticmethod
+    async def _receipt_pin(page: Page) -> str | None:
+        """The product PIN on the receipt (markup: <div class="pin-code">).
+
+        Falls back to the text after "Your PIN is". The serial number below the
+        PIN is not part of it.
+        """
+        for _ in range(10):
+            try:
+                pin = await page.evaluate(
+                    "document.querySelector('.pin-code')?.textContent || ''"
+                )
+                text = await page.evaluate("document.body?.textContent || ''")
+            except PlaywrightError:
+                pin = text = ""
+            pin = re.sub(r"\s+", "", pin or "")
+            if not pin:
+                match = re.search(
+                    r"your\s+pin\s+is\s*:?\s*([A-Za-z0-9-]{6,40})", text, re.IGNORECASE
+                )
+                pin = match.group(1) if match else ""
+            if pin:
+                return pin
             await asyncio.sleep(0.5)
         return None
 
