@@ -178,6 +178,12 @@ class RazerAccountSession:
     last_purchased: str | None = None
     # Product PIN shown on the last receipt, or None if it could not be read.
     last_pin: str | None = None
+    # Address of the last receipt page (/gold/purchase/transaction/<id>): lets a
+    # PIN that could not be read be read again later.
+    last_receipt_url: str | None = None
+    # Called the moment a receipt has been read, before anything else happens,
+    # as (product, pin, receipt_url). The purchaser saves the PIN there.
+    on_receipt: Callable[[str | None, str | None, str | None], Awaitable[None]] | None = None
 
 
 class RazerSessionManager:
@@ -638,6 +644,7 @@ class RazerSessionManager:
         session.on_product_menu = False
         session.last_purchased = None
         session.last_pin = None
+        session.last_receipt_url = None
         page = session.page
         await self._dismiss_cookie_banner(page)
         lap("menu")
@@ -680,10 +687,7 @@ class RazerSessionManager:
         lap(f"razer-{stage}")
         if stage == "success":
             await self._snapshot(page, "success-no-2fa")
-            session.last_purchased = await self._receipt_product(page)
-            session.last_pin = await self._receipt_pin(page)
-            if session.last_pin is None:
-                await self._snapshot(page, "success-no-pin", force=True)
+            await self._read_receipt(session, page)
             lap("receipt")
             return PurchaseOutcome.SUCCESS
         if stage == "insufficient":
@@ -903,10 +907,7 @@ class RazerSessionManager:
                 if _SUCCESS_PATTERN.search(text):
                     session.page = candidate
                     await self._snapshot(candidate, "success")
-                    session.last_purchased = await self._receipt_product(candidate)
-                    session.last_pin = await self._receipt_pin(candidate)
-                    if session.last_pin is None:
-                        await self._snapshot(candidate, "success-no-pin", force=True)
+                    await self._read_receipt(session, candidate)
                     return PurchaseOutcome.SUCCESS
                 if _CODE_REJECTED_PATTERN.search(text):
                     await self._snapshot(candidate, "code-rejected")
@@ -982,14 +983,58 @@ class RazerSessionManager:
             await asyncio.sleep(0.5)
         return None
 
+    async def _read_receipt(self, session: RazerAccountSession, page: Page) -> None:
+        """Read the receipt (product, PIN, address) and hand it over at once.
+
+        The address is taken first, so even if the PIN cannot be read the
+        purchase can be traced and the PIN read again later. A PIN that is slow
+        to appear is waited for (about 15 s); the page is never reloaded, since
+        a receipt may show its PIN only once.
+        """
+        session.last_receipt_url = page.url
+        session.last_purchased = await self._receipt_product(page)
+        pin = await self._receipt_pin(page)
+        if pin is None:
+            pin = await self._receipt_pin(page, attempts=20)
+        session.last_pin = pin
+        if pin is None:
+            await self._snapshot(page, "success-no-pin", force=True)
+        if session.on_receipt is not None:
+            try:
+                await session.on_receipt(
+                    session.last_purchased, session.last_pin, session.last_receipt_url
+                )
+            except Exception:
+                logger.exception("Could not record the receipt")
+
+    async def read_receipt_pin(self, session: RazerAccountSession, url: str) -> str | None:
+        """Open an earlier receipt again and read its PIN (None if still unreadable).
+
+        Only Razer's own transaction pages are opened.
+        """
+        if not url.startswith("https://gold.razer.com/"):
+            return None
+        page = await session.context.new_page()
+        try:
+            with contextlib.suppress(PlaywrightTimeoutError, PlaywrightError):
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            await self._dismiss_cookie_banner(page)
+            pin = await self._receipt_pin(page)
+            if pin is None:
+                await self._snapshot(page, "receipt-reread-no-pin", force=True)
+            return pin
+        finally:
+            with contextlib.suppress(PlaywrightError):
+                await page.close()
+
     @staticmethod
-    async def _receipt_pin(page: Page) -> str | None:
+    async def _receipt_pin(page: Page, attempts: int = 10) -> str | None:
         """The product PIN on the receipt (markup: <div class="pin-code">).
 
         Falls back to the text after "Your PIN is". The serial number below the
         PIN is not part of it.
         """
-        for _ in range(10):
+        for _ in range(attempts):
             try:
                 pin = await page.evaluate(
                     "document.querySelector('.pin-code')?.textContent || ''"

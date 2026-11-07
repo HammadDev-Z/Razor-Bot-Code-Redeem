@@ -7,6 +7,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from razer_session import (
+    PRODUCTS_BY_CODE,
     BackupCodesUnreadableError,
     InvalidCredentialsError,
     PurchaseOutcome,
@@ -85,7 +86,25 @@ def codes_messages(state: BotState, title: str) -> list[str]:
             blocks.append((heading, pins))
     if not blocks:
         return []
+    footer = ""
+    if missing:
+        footer = (
+            f"Not listed: {missing} bought without a saved code (before codes were "
+            "saved, or the receipt could not be read). They are in your Razer "
+            "email and transaction history."
+        )
+        if state.missing_receipts:
+            footer += (
+                f" {len(state.missing_receipts)} of them are being read again from "
+                "their receipts at the next checks."
+            )
+    return _chunk_blocks(title, blocks, footer)
 
+
+def _chunk_blocks(
+    title: str, blocks: list[tuple[str, list[str]]], footer: str = ""
+) -> list[str]:
+    """Headings with their codes, split into messages below Telegram's limit."""
     messages: list[str] = []
     current = [title]
     size = len(title)
@@ -99,15 +118,23 @@ def codes_messages(state: BotState, title: str) -> list[str]:
                 size = len(current[0])
             current.append(pin)
             size += len(pin) + 1
-    if missing:
-        current.append("")
-        current.append(
-            f"Not listed: {missing} bought without a saved code (before codes were "
-            "saved, or the receipt could not be read). They are in your Razer "
-            "email and transaction history."
-        )
+    if footer:
+        current += ["", footer]
     messages.append("\n".join(current))
     return messages
+
+
+def waiting_codes_messages(state: BotState, title: str) -> list[str]:
+    """The codes still waiting to be uploaded, for copying by hand."""
+    grouped: dict[str, list[str]] = {}
+    for category, pin in state.upload_queue:
+        grouped.setdefault(category, []).append(pin)
+    blocks = []
+    for category, pins in grouped.items():
+        product = PRODUCTS_BY_CODE.get(category, category)
+        name = product.removeprefix("Yalla Ludo - ")
+        blocks.append((f"{name} ({category}): {len(pins)} codes", pins))
+    return _chunk_blocks(title, blocks) if blocks else []
 
 
 class Purchaser:
@@ -138,6 +165,10 @@ class Purchaser:
         self._uploaded_this_check = 0
         self._upload_error = ""
         self._upload_down = False
+        # PINs handled by this process, so a receipt seen twice is queued once.
+        self._seen_pins: set[str] = set()
+        # The product being bought, for a receipt whose product name is unreadable.
+        self._intended_code = ""
         self._lock = asyncio.Lock()
 
     @property
@@ -276,6 +307,122 @@ class Purchaser:
             )
         return " ".join(parts)
 
+    def _remember_pin(
+        self, state: BotState, product: str | None, pin: str | None, url: str | None
+    ) -> None:
+        """Keep a bought code safe: save it, queue it for the website.
+
+        Called the moment the receipt is read and again when the purchase is
+        counted, so it must be harmless to repeat. A code that could not be
+        read leaves the receipt address behind to read it again later.
+        """
+        code = {name: key for key, name in PRODUCTS_BY_CODE.items()}.get(product or "")
+        code = code or self._intended_code
+        if not code:
+            return
+        if pin:
+            if pin in self._seen_pins:
+                return
+            self._seen_pins.add(pin)
+            if state.find_item(code) is not None:
+                saved = state.pins.setdefault(code, [])
+                if pin not in saved:
+                    saved.append(pin)
+            if not any(entry[1] == pin for entry in state.upload_queue):
+                state.upload_queue.append([code, pin])
+        elif url and not any(entry[1] == url for entry in state.missing_receipts):
+            state.missing_receipts.append([code, url, "0"])
+        self._store.save()
+
+    async def _recover_pins(self, session: RazerAccountSession, account_id: str) -> None:
+        """Read again the receipts whose code could not be read when bought."""
+        state = self._current(account_id)
+        if state is None or not state.missing_receipts:
+            return
+        for entry in list(state.missing_receipts):
+            code, url, tries = entry
+            try:
+                pin = await self._sessions.read_receipt_pin(session, url)
+            except Exception:
+                logger.exception("Could not re-read a receipt")
+                pin = None
+            live = self._current(account_id)
+            if live is None:
+                return
+            if pin:
+                live.missing_receipts = [e for e in live.missing_receipts if e[1] != url]
+                if pin not in self._seen_pins:
+                    self._seen_pins.add(pin)
+                    if live.find_item(code) is not None:
+                        saved = live.pins.setdefault(code, [])
+                        if pin not in saved:
+                            saved.append(pin)
+                    if not any(e[1] == pin for e in live.upload_queue):
+                        live.upload_queue.append([code, pin])
+                logger.info("Read a code from an earlier receipt")
+                await self._notify(
+                    f"Read the missing {PRODUCTS_BY_CODE.get(code, code)} code from its "
+                    f"receipt: {pin}"
+                )
+            else:
+                entry[2] = str(int(tries) + 1)
+                if int(entry[2]) == 3:
+                    product = PRODUCTS_BY_CODE.get(code, code)
+                    await self._notify(
+                        f"Could not read the code of a {product} purchase after 3 "
+                        "tries. Open this receipt while logged in to the Razer "
+                        "account and copy the code by hand:\n" + url
+                    )
+            self._store.save()
+
+    async def _recover_only(self, account_id: str) -> None:
+        """Open the account just to re-read receipts (nothing is bought)."""
+        state = self._current(account_id)
+        if state is None:
+            return
+        try:
+            session = await self._sessions.open_account(
+                state.email, state.password, state.storage_state
+            )
+        except RazerLoginError as exc:
+            logger.warning("Could not open the account to re-read receipts: %s", exc)
+            return
+        try:
+            await self._recover_pins(session, account_id)
+        finally:
+            storage_state = await self._sessions.close(session)
+            if (live := self._current(account_id)) is not None and storage_state:
+                live.storage_state = storage_state
+                self._store.save()
+
+    async def _finish_uploads(self, account_id: str) -> None:
+        """Last upload attempt of a check; hand the codes over if it keeps failing.
+
+        After 3 checks in a row with codes still waiting, the codes themselves
+        are sent to Telegram once, so none can be lost with a broken website.
+        """
+        await self._flush_uploads(account_id)
+        state = self._current(account_id)
+        if state is None or self._uploader is None:
+            return
+        if not state.upload_queue:
+            if state.upload_failures or state.upload_alerted:
+                state.upload_failures, state.upload_alerted = 0, False
+                self._store.save()
+            return
+        if self._upload_error:
+            state.upload_failures += 1
+            self._store.save()
+        if state.upload_failures >= 3 and not state.upload_alerted:
+            for text in waiting_codes_messages(
+                state,
+                "These bought codes could not be uploaded to the website after 3 "
+                "checks. Add them by hand (they stay queued and keep retrying):",
+            ):
+                await self._notify(text)
+            state.upload_alerted = True
+            self._store.save()
+
     def _current(self, account_id: str) -> BotState | None:
         """The live state, or None if the account was replaced or deleted."""
         state = self._store.state
@@ -284,17 +431,22 @@ class Purchaser:
     async def _run_cycle(self, manual: bool) -> None:
         state = self._store.state
         account_id = state.account_id
+        self._uploaded_this_check = 0
+        self._upload_error = ""
+        self._upload_down = False
         reason = blocked_reason(state)
         if reason:
+            # Even with nothing to buy, a code that could not be read at purchase
+            # time is read again, and bought codes still reach the website.
+            if state.missing_receipts and state.has_account and not state.login_blocked:
+                await self._recover_only(account_id)
+            await self._finish_uploads(account_id)
             if manual:
                 await self._report(reason, force=True)
             return
 
         state.last_check_at = now_text()
         self._store.save()
-        self._uploaded_this_check = 0
-        self._upload_error = ""
-        self._upload_down = False
         try:
             session = await self._sessions.open_account(
                 state.email, state.password, state.storage_state
@@ -325,6 +477,18 @@ class Purchaser:
             state.storage_state = await self._sessions.export_storage_state(session)
             state.last_balance = session.balance
             self._store.save()
+
+            async def record_receipt(
+                product: str | None, pin: str | None, url: str | None
+            ) -> None:
+                # Runs the moment the receipt is read: the code is saved before
+                # anything else can go wrong.
+                live = self._current(account_id)
+                if live is not None:
+                    self._remember_pin(live, product, pin, url)
+
+            session.on_receipt = record_receipt
+            await self._recover_pins(session, account_id)
 
             refresh_tried = refresh_failed = False
             while True:
@@ -364,6 +528,7 @@ class Purchaser:
                     self._store.save()
                     return backup_code
 
+                self._intended_code = item.code
                 outcome = await self._sessions.purchase_one(
                     session, item.product, mark_pending, take_code
                 )
@@ -380,14 +545,14 @@ class Purchaser:
                     credited = state.find_item_by_product(actual)
                     if credited is not None:
                         credited.done += 1
-                        pin = getattr(session, "last_pin", None)
-                        if pin:
-                            saved = state.pins.setdefault(credited.code, [])
-                            if pin not in saved:
-                                saved.append(pin)
-                                state.upload_queue.append([credited.code, pin])
-                        else:
-                            logger.warning("No PIN could be read for %s", actual)
+                    # Normally already saved by the receipt callback; this is
+                    # the safety net (and handles a receipt for another product).
+                    pin = getattr(session, "last_pin", None)
+                    self._remember_pin(
+                        state, actual, pin, getattr(session, "last_receipt_url", None)
+                    )
+                    if not pin:
+                        logger.warning("No code could be read for %s", actual)
                     state.pending = None
                     bought += 1
                     logger.info("Bought %s (%s total this check)", actual, bought)
@@ -450,7 +615,7 @@ class Purchaser:
 
         if self._current(account_id) is None:
             return
-        await self._flush_uploads(account_id)
+        await self._finish_uploads(account_id)
         await self._report(
             stop_message,
             force=manual or bought > 0,

@@ -318,6 +318,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines.append(f"Backup codes left: {len(state.backup_codes)}")
     if state.upload_queue:
         lines.append(f"Codes waiting to upload to the website: {len(state.upload_queue)}")
+    if state.missing_receipts:
+        lines.append(
+            f"Purchases whose code could not be read yet: {len(state.missing_receipts)} "
+            "(read again at each check). Receipts:"
+        )
+        lines.extend(entry[1] for entry in state.missing_receipts[:5])
     balance = "unknown" if state.last_balance is None else f"{state.last_balance:.2f}"
     lines.append(f"Razer Gold (last seen): {balance}")
     lines.append(f"Last check: {state.last_check_at or 'never'}")
@@ -395,11 +401,16 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ]
     )
     text = "Delete the account, saved login, backup codes, order and progress?"
-    waiting = len(_store(context).state.upload_queue)
-    if waiting:
+    state = _store(context).state
+    if state.upload_queue:
         text += (
-            f"\n\nWarning: {waiting} bought codes are not on the website yet and "
-            "would be lost. Wait for the next check to upload them, or use /codes."
+            f"\n\n{len(state.upload_queue)} bought codes are not on the website yet. "
+            "They are kept and uploaded later."
+        )
+    if state.missing_receipts:
+        text += (
+            f"\n\n{len(state.missing_receipts)} purchases have a code that could not "
+            "be read yet; deleting forgets them. See /status for their receipts."
         )
     await update.effective_message.reply_text(text, reply_markup=keyboard)
 

@@ -98,6 +98,12 @@ website's inventory under its category right after it is bought: 830 -> 830, 232
 retried at every check; each check's message says how many were uploaded or are waiting, and
 `/status` shows the waiting count. Repeats are skipped by the website, never duplicated.
 
+No bought code is lost: it is saved to disk the moment the receipt is read, so even a crash right
+afterwards keeps it; a code that cannot be read is read again from its receipt at the next checks
+(you get its receipt address if that keeps failing); if the website stays unreachable for 3 checks
+the codes are sent to you in Telegram to add by hand, and they keep retrying. `/cancel` keeps
+codes that are not on the website yet. Wrong keys on the website are throttled.
+
 When 2 backup codes are left (`BACKUP_CODES_REFRESH_AT`), the bot logs in to
 Razer ID, generates a new set of backup codes and saves them. The old codes stop
 working. If it ever can't read the new codes, it pauses and asks you to send them

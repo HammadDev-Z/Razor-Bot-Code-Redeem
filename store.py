@@ -63,6 +63,13 @@ class BotState:
     # [item code, PIN] pairs bought but not yet confirmed by the website's stock.
     # Unlike pins, a new /order does not touch it: these are real, paid-for codes.
     upload_queue: list[list[str]] = field(default_factory=list)
+    # [item code, receipt address, failed reads] for purchases whose PIN could not
+    # be read from the receipt. Re-read at the next checks until it works.
+    missing_receipts: list[list[str]] = field(default_factory=list)
+    # Checks in a row that ended with codes still waiting to upload, and whether
+    # the codes were already sent to Telegram for copying by hand.
+    upload_failures: int = 0
+    upload_alerted: bool = False
 
     @property
     def has_account(self) -> bool:
@@ -121,6 +128,13 @@ class BotState:
                 for entry in (data.get("upload_queue") or [])
                 if len(entry) == 2
             ],
+            missing_receipts=[
+                [str(entry[0]), str(entry[1]), str(entry[2]) if len(entry) > 2 else "0"]
+                for entry in (data.get("missing_receipts") or [])
+                if len(entry) >= 2
+            ],
+            upload_failures=int(data.get("upload_failures", 0) or 0),
+            upload_alerted=bool(data.get("upload_alerted", False)),
         )
 
 
@@ -178,6 +192,9 @@ class StateStore:
             pending=old.pending,
             pins=old.pins,
             upload_queue=old.upload_queue,
+            missing_receipts=old.missing_receipts,
+            upload_failures=old.upload_failures,
+            upload_alerted=old.upload_alerted,
         )
         self.save()
 
@@ -197,10 +214,18 @@ class StateStore:
         self.save()
 
     def clear(self) -> None:
-        """Delete everything: account, saved login, codes, order, progress."""
-        self.state = BotState()
-        self._path.unlink(missing_ok=True)
+        """Delete everything: account, saved login, codes, order, progress.
+
+        The one exception is bought voucher PINs that are not on the website
+        yet: they are paid for, so they stay (encrypted) until uploaded.
+        """
+        kept = self.state.upload_queue
+        self.state = BotState(upload_queue=kept)
         self._path.with_suffix(".tmp").unlink(missing_ok=True)
+        if kept:
+            self.save()
+        else:
+            self._path.unlink(missing_ok=True)
 
 
 _KEY_HELP = (
