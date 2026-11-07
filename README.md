@@ -91,6 +91,13 @@ the order is finished the bot sends them all in a new message, one heading per p
 `/order` cancels the previous order and its saved codes; the bot sends that old order's
 codes first so none are lost.
 
+**Website stock.** With `STOCK_API_URL` (e.g. `https://codeguy.online/api/stock/import`) and
+`STOCK_API_KEY` set in `.env` (the same key as on the website), every bought code is added to the
+website's inventory under its category right after it is bought: 830 -> 830, 2320 -> 2320,
+5k -> 5150, 13k, 27k, 56k. If the website is unreachable the codes wait in the bot and are
+retried at every check; each check's message says how many were uploaded or are waiting, and
+`/status` shows the waiting count. Repeats are skipped by the website, never duplicated.
+
 When 2 backup codes are left (`BACKUP_CODES_REFRESH_AT`), the bot logs in to
 Razer ID, generates a new set of backup codes and saves them. The old codes stop
 working. If it ever can't read the new codes, it pauses and asks you to send them

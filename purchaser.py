@@ -16,6 +16,7 @@ from razer_session import (
     VerificationRequiredError,
 )
 from store import BotState, PendingPurchase, StateStore, now_text
+from stock_uploader import StockUploader, UploadError
 
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,7 @@ class Purchaser:
         refresh_at: int = 2,
         notify_every_check: bool = True,
         on_cycle_done: Callable[[], None] | None = None,
+        uploader: StockUploader | None = None,
     ) -> None:
         self._store = store
         self._sessions = sessions
@@ -131,6 +133,11 @@ class Purchaser:
         # Called after every check that ran (manual or timer), e.g. to restart
         # the countdown to the next one.
         self._on_cycle_done = on_cycle_done
+        # Sends each bought PIN to the website's stock; None when not configured.
+        self._uploader = uploader
+        self._uploaded_this_check = 0
+        self._upload_error = ""
+        self._upload_down = False
         self._lock = asyncio.Lock()
 
     @property
@@ -215,6 +222,60 @@ class Purchaser:
         )
         return True
 
+    async def _flush_uploads(self, account_id: str, *, quick: bool = False) -> None:
+        """Send queued PINs to the website's stock, per category.
+
+        A PIN leaves the queue only once the website confirmed it, so a failed
+        or interrupted upload is retried at the next check. ``quick`` (right
+        after a purchase) gives up for the rest of this check after one
+        failure, so a website that is down never slows the buying.
+        """
+        if self._uploader is None or (quick and self._upload_down):
+            return
+        state = self._current(account_id)
+        if state is None or not state.upload_queue:
+            return
+        batches: dict[str, list[str]] = {}
+        for category, pin in state.upload_queue:
+            batches.setdefault(category, []).append(pin)
+        for category, pins in batches.items():
+            try:
+                await self._uploader.upload(category, pins)
+            except UploadError as exc:
+                self._upload_error = str(exc)
+                self._upload_down = True
+                logger.warning("Stock upload failed: %s", exc)
+                return
+            live = self._current(account_id)
+            if live is None:
+                return
+            sent = set(pins)
+            live.upload_queue = [
+                entry
+                for entry in live.upload_queue
+                if not (entry[0] == category and entry[1] in sent)
+            ]
+            self._store.save()
+            self._uploaded_this_check += len(pins)
+            logger.info("Uploaded %s codes to the website (%s)", len(pins), category)
+
+    def _upload_note(self, account_id: str) -> str:
+        """One line for the check's message about the website upload, or ''."""
+        if self._uploader is None:
+            return ""
+        state = self._current(account_id)
+        waiting = len(state.upload_queue) if state else 0
+        parts = []
+        if self._uploaded_this_check:
+            parts.append(f"Uploaded {self._uploaded_this_check} codes to the website.")
+        if waiting:
+            reason = f": {self._upload_error}" if self._upload_error else ""
+            parts.append(
+                f"{waiting} codes are waiting to upload{reason}. "
+                "Retrying at the next check."
+            )
+        return " ".join(parts)
+
     def _current(self, account_id: str) -> BotState | None:
         """The live state, or None if the account was replaced or deleted."""
         state = self._store.state
@@ -231,6 +292,9 @@ class Purchaser:
 
         state.last_check_at = now_text()
         self._store.save()
+        self._uploaded_this_check = 0
+        self._upload_error = ""
+        self._upload_down = False
         try:
             session = await self._sessions.open_account(
                 state.email, state.password, state.storage_state
@@ -321,6 +385,7 @@ class Purchaser:
                             saved = state.pins.setdefault(credited.code, [])
                             if pin not in saved:
                                 saved.append(pin)
+                                state.upload_queue.append([credited.code, pin])
                         else:
                             logger.warning("No PIN could be read for %s", actual)
                     state.pending = None
@@ -334,9 +399,11 @@ class Purchaser:
                             "history and /status, then send /checknow to continue."
                         )
                         self._store.save()
+                        await self._flush_uploads(account_id, quick=True)
                         stop_message = state.paused
                         break
                     self._store.save()
+                    await self._flush_uploads(account_id, quick=True)
                     continue
                 if outcome is PurchaseOutcome.INSUFFICIENT_GOLD:
                     state.pending = None
@@ -383,12 +450,14 @@ class Purchaser:
 
         if self._current(account_id) is None:
             return
+        await self._flush_uploads(account_id)
         await self._report(
             stop_message,
             force=manual or bought > 0,
             bought=bought,
             balance=balance_now,
             stamp=True,
+            note=self._upload_note(account_id),
         )
         # The order was finished by this check: hand over every code.
         if bought and (live := self._current(account_id)) is not None and live.order_complete:
@@ -403,6 +472,7 @@ class Purchaser:
         bought: int = 0,
         balance: float | None = None,
         stamp: bool = False,
+        note: str = "",
     ) -> None:
         """Send a status message, skipping exact repeats of the last one.
 
@@ -427,6 +497,8 @@ class Purchaser:
             lines.append("Order complete. No more purchases will be made.")
         elif message:
             lines.append(message)
+        if lines and note:
+            lines.append(note)
         if lines and balance is not None:
             lines.append(f"Razer Gold left: {balance:.2f}")
         if lines and stamp:

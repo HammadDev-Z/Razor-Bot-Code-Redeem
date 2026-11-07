@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from purchaser import Purchaser, blocked_reason, codes_messages, progress_text
 from razer_session import PRODUCTS_BY_CODE, RazerSessionManager
+from stock_uploader import StockUploader
 from store import StateStore, parse_order
 
 
@@ -315,6 +316,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     lines = [f"Account: {state.email or 'none'}"]
     lines.append("Order:\n" + (progress_text(state) or "none"))
     lines.append(f"Backup codes left: {len(state.backup_codes)}")
+    if state.upload_queue:
+        lines.append(f"Codes waiting to upload to the website: {len(state.upload_queue)}")
     balance = "unknown" if state.last_balance is None else f"{state.last_balance:.2f}"
     lines.append(f"Razer Gold (last seen): {balance}")
     lines.append(f"Last check: {state.last_check_at or 'never'}")
@@ -391,10 +394,14 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ]
         ]
     )
-    await update.effective_message.reply_text(
-        "Delete the account, saved login, backup codes, order and progress?",
-        reply_markup=keyboard,
-    )
+    text = "Delete the account, saved login, backup codes, order and progress?"
+    waiting = len(_store(context).state.upload_queue)
+    if waiting:
+        text += (
+            f"\n\nWarning: {waiting} bought codes are not on the website yet and "
+            "would be lost. Wait for the next check to upload them, or use /codes."
+        )
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
 
 
 async def cancel_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -474,12 +481,17 @@ def build_application() -> Application:
         for job in application.job_queue.get_jobs_by_name(CHECK_JOB_NAME):
             job.job.modify(next_run_time=due)
 
+    uploader = StockUploader.from_env()
+    logger.info(
+        "Website stock upload is %s", "on" if uploader else "off (STOCK_API_URL / STOCK_API_KEY not set)"
+    )
     application.bot_data["purchaser"] = Purchaser(
         store,
         sessions,
         notify,
         interval_minutes,
         on_cycle_done=restart_check_timer,
+        uploader=uploader,
         refresh_at=int(os.getenv("BACKUP_CODES_REFRESH_AT", "2")),
         notify_every_check=os.getenv("NOTIFY_EVERY_CHECK", "true").strip().lower()
         in {"1", "true", "yes", "on"},

@@ -60,6 +60,9 @@ class BotState:
     # Product PINs read from the receipts, per order item code, in purchase order.
     # Belong to the current order: a new /order clears them.
     pins: dict[str, list[str]] = field(default_factory=dict)
+    # [item code, PIN] pairs bought but not yet confirmed by the website's stock.
+    # Unlike pins, a new /order does not touch it: these are real, paid-for codes.
+    upload_queue: list[list[str]] = field(default_factory=list)
 
     @property
     def has_account(self) -> bool:
@@ -113,6 +116,11 @@ class BotState:
                 for code, pins in (data.get("pins") or {}).items()
                 if code in PRODUCTS_BY_CODE
             },
+            upload_queue=[
+                [str(entry[0]), str(entry[1])]
+                for entry in (data.get("upload_queue") or [])
+                if len(entry) == 2
+            ],
         )
 
 
@@ -169,6 +177,7 @@ class StateStore:
             order=old.order,
             pending=old.pending,
             pins=old.pins,
+            upload_queue=old.upload_queue,
         )
         self.save()
 
